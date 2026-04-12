@@ -254,6 +254,13 @@ async def pvoutput_put(data_snapshot: dict):
     post_date = now.strftime("%Y%m%d")
     post_time = now.strftime("%H:%M")  # This is the string we must protect
 
+    if data_snapshot.get('batt_power', 0) > 0:  # Battery is discharging
+        batt_power_out = data_snapshot.get('batt_power', 0)
+        batt_power_in = 0
+    else:  # Battery is charging
+        batt_power_out = 0
+        batt_power_in = -1 * data_snapshot.get('batt_power', 0)
+
     payload = {
         "d"  : post_date,
         "key": stgs.PVOutput.key,
@@ -263,8 +270,10 @@ async def pvoutput_put(data_snapshot: dict):
         "v5" : data_snapshot.get('aux_temp', 0),
         "v6" : data_snapshot.get('line_voltage', 0),
         "v7" : data_snapshot.get('aux_ev_power',0),
+        "v8" : batt_power_out,
         "v9" : data_snapshot.get('aux_co2',0),
         "v10": int(data_snapshot.get('aux_co2',0) * data_snapshot.get('consumption', 0)),
+        "v11": batt_power_in,
         "v12": data_snapshot.get('line_frequency', 0),
         "b1" : data_snapshot.get('batt_power', 0) * -1,
         "b2" : data_snapshot.get('soc', 0),
@@ -280,8 +289,10 @@ async def pvoutput_put(data_snapshot: dict):
         "v5" : data_snapshot.get('aux_temp', 0),
         "v6" : data_snapshot.get('line_voltage', 0),
         "v7" : data_snapshot.get('aux_ev_power',0),
+        "v8" : batt_power_out,
         "v9" : data_snapshot.get('aux_co2',0),
         "v10": int(data_snapshot.get('aux_co2',0) * data_snapshot.get('consumption', 0)),
+        "v11": batt_power_in,
         "v12": data_snapshot.get('line_frequency', 0),
         "b1" : data_snapshot.get('batt_power', 0) * -1,
         "b2" : data_snapshot.get('soc', 0),

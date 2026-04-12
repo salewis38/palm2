@@ -1,52 +1,46 @@
 #!/usr/bin/env python3
 """
-PALM - PV Active Load Manager (Robust Version)
+PALMv2 - PV Active Load Manager
 Integrates local Modbus control with resilient error handling.
 """
 
 import logging
 import asyncio
 import signal
+import sys
+from pprint import pprint
 from datetime import datetime, timedelta
 import time
+from enum import Enum, auto
 import httpx
 import palm_settings as stgs
 from givenergy_modbus.client.client import Client
 
-# This software in any form is covered by the following Open Source BSD license:
-#
 # Copyright 2026, Steve Lewis
-# All rights reserved.
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+# and associated documentation files (the “Software”), to deal in the Software without
+# restriction, including without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
 #
-# Redistribution and use in source and binary forms, with or without modification, are permitted
-# provided that the following conditions are met:
+# The above copyright notice and this permission notice shall be included in all copies or
+# substantial portions of the Software.
 #
-# 1. Redistributions of source code must retain the above copyright notice, this list of conditions
-# and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice, this list of
-# conditions and the following disclaimer in the documentation and/or other materials provided
-# with the distribution.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS
-# OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
-# AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
-# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
-# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY
-# WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+# BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+# DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 # Changelog:
 # v2.0.0    10/Apr/26 First version to handle continuous Modbus data collection and control.
+# v2.0.1    10/Apr/26 Added state machine for battery control and CLI settings.
 
-#FIXME: Needs CLI modes, evening export, inverter control based on EV charging, etc. to be restored.
-
-
-PALM_VERSION = "v2.0.0"
+PALM_VERSION = "v2.0.1"
 # -*- coding: utf-8 -*-
 # pylint: disable=logging-not-lazy
 # pylint: disable=consider-using-f-string
+# pylint: disable=logging-fstring-interpolation
 
 # Enhanced logging
 logging.basicConfig(
@@ -56,13 +50,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Get the logger for 'httpx'
+# Set the logger for 'httpx' to WARNING to ignore INFO and DEBUG logs
 httpx_logger = logging.getLogger("httpx")
-
-# Set the logging level to WARNING to ignore INFO and DEBUG logs
 httpx_logger.setLevel(logging.WARNING)
 
-class GivEnergyObjLocal:
+
+class GivEnergyLocal:
     """Class for GivEnergy inverter (local access) with robust sync."""
 
     def __init__(self):
@@ -120,8 +113,7 @@ class GivEnergyObjLocal:
                 self._client = None
 
     async def get_latest_data(self):
-        """Fetch data."""
-
+        """Fetch inverter data."""
         if self._consecutive_failures >= self.MAX_FAILURES:
             logger.warning("Cooling down due to consecutive failures...")
             await asyncio.sleep(30)
@@ -154,7 +146,6 @@ class GivEnergyObjLocal:
                 logger.error(f"Read failure ({self._consecutive_failures}/{self.MAX_FAILURES}): {e}")
                 await self.close_connection()
 
-
     def _update_internal_state(self, inv):
         """Mapping logic from raw inverter registers to class variables."""
         self.read_time_mins = inv.system_time_hour * 60 + inv.system_time_minute
@@ -177,6 +168,9 @@ class GivEnergyObjLocal:
 
     async def set_mode(self, cmd: str):
         """Executes inverter control commands with persistence and locking."""
+        if stgs.pg.test_mode:
+            logger.info(f"DRY RUN: Setting inverter mode: {cmd}")
+            return
         logger.info(f"Setting inverter mode: {cmd}")
 
         async with self._lock:
@@ -190,9 +184,7 @@ class GivEnergyObjLocal:
                 await asyncio.wait_for(client.refresh_plant(full_refresh=False), timeout=10.0)
                 cmds = client.commands
 
-                # Define verification expectations
-                # Format: (attribute_to_check, expected_value)
-                verify_target = None
+                verify_target = None  # Used to read-back last command in a sequence
 
                 if cmd == "charge_now":
                     await client.execute(cmds.set_charge_slot_1_start(0),2.0,2)
@@ -242,7 +234,6 @@ class GivEnergyObjLocal:
                 else:
                     logger.error(f"Unknown command: {cmd}")
 
-
                 if verify_target:
                     attr, expected = verify_target
                     for attempt in range(1, 4):
@@ -265,37 +256,30 @@ class GivEnergyObjLocal:
                 logger.error(f"Command execution failure for {cmd}: {e}")
                 await self.close_connection()
                 return False
-#  End of GivEnergyObjLocal()
+#  End of GivEnergyLocal() class
 
 
-async def put_pv_output(data_snapshot: dict):
+async def pvoutput_put(data_snapshot: dict):
     """ Asynchronously uploads data to PVOutput.org.
     Bypasses standard URL encoding for the timestamp to preserve literal colons."""
 
-    # 1. Prepare the base data
     now = datetime.now() - timedelta(seconds=60)
     post_date = now.strftime("%Y%m%d")
     post_time = now.strftime("%H:%M")  # This is the string we must protect
 
-    batt_pwr = data_snapshot.get('batt_power', 0)
-    load_pwr = data_snapshot.get('consumption', 0)  # Changed since original
-
-    # 2. Build the payload dictionary
     payload = {
         "d"  : post_date,
         "key": stgs.PVOutput.key,
         "sid": stgs.PVOutput.sid,
         "v2" : data_snapshot.get('pv_power', 0),
-        "v4" : load_pwr,
+        "v4" : data_snapshot.get('consumption', 0),
         "v5" : data_snapshot.get('aux_temp', 0),
         "v6" : data_snapshot.get('line_voltage', 0),
         "v7" : data_snapshot.get('aux_ev_power',0),
-        "v8" : max(batt_pwr, 0),
         "v9" : data_snapshot.get('aux_co2',0),
-        "v10": int(data_snapshot.get('aux_co2',0) * load_pwr),
-        "v11": abs(min(batt_pwr, 0)),
+        "v10": int(data_snapshot.get('aux_co2',0) * data_snapshot.get('consumption', 0)),
         "v12": data_snapshot.get('line_frequency', 0),
-        "b1" : batt_pwr * -1,
+        "b1" : data_snapshot.get('batt_power', 0) * -1,
         "b2" : data_snapshot.get('soc', 0),
         "b3" : int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation *1000),
         "b4" : data_snapshot.get('e_battery_charge_total', 0),
@@ -305,30 +289,23 @@ async def put_pv_output(data_snapshot: dict):
     # Legacy part_payload. Now only used for logging
     part_payload = {
         "v2" : data_snapshot.get('pv_power', 0),
-        "v4" : load_pwr,
+        "v4" : data_snapshot.get('consumption', 0),
         "v5" : data_snapshot.get('aux_temp', 0),
         "v6" : data_snapshot.get('line_voltage', 0),
         "v7" : data_snapshot.get('aux_ev_power',0),
-        "v8" : max(batt_pwr, 0),
         "v9" : data_snapshot.get('aux_co2',0),
-        "v10": int(data_snapshot.get('aux_co2',0) * load_pwr),
-        "v11": abs(min(batt_pwr, 0)),
+        "v10": int(data_snapshot.get('aux_co2',0) * data_snapshot.get('consumption', 0)),
         "v12": data_snapshot.get('line_frequency', 0),
-        "b1" : batt_pwr * -1,
+        "b1" : data_snapshot.get('batt_power', 0) * -1,
         "b2" : data_snapshot.get('soc', 0),
         "b3" : int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation *1000),
         "b4" : data_snapshot.get('e_battery_charge_total', 0),
         "b5" : data_snapshot.get('e_battery_discharge_total', 0)
     }
 
-    # 3. Manually construct the URL to prevent httpx from encoding the colon
-    # Encode the other params, then tack on the raw time at the end
+    # Manually construct URL to prevent httpx from encoding the colon
     base_url = f"{stgs.PVOutput.url.rstrip('/')}/addstatus.jsp"
-
-    # Standard encode everything EXCEPT time
     query_string = "&".join([f"{k}={v}" for k, v in payload.items()])
-
-    # Add the "protected" time parameter with its literal colon
     final_url = f"{base_url}?{query_string}&t={post_time}"
 
     if stgs.pg.test_mode:
@@ -348,10 +325,10 @@ async def put_pv_output(data_snapshot: dict):
             logger.error(f"PVOutput API Error ({e.response.status_code}): {e.response.text}")
         except Exception as e:
             logger.error(f"PVOutput Connection Failed: {e}")
+#  End of pvoutput_put()
 
-#  End of put_pv_output()
 
-class ShellyObj():
+class Shelly():
     """Routines to return status of Shelly switches and power meters and set switches. """
 
     def __init__(self):
@@ -387,7 +364,7 @@ class ShellyObj():
 
                 # Shelly Gen 2 'Switch.GetStatus' returns { "output": bool, ... }
                 state = parsed.get('output', False)
-                return "On-stat" if state else "Off"
+                return "On" if state else "Off"
 
             except (httpx.HTTPError, KeyError) as error:
                 logger.error(f"Missing response from Shelly Switch: {error}")
@@ -395,7 +372,6 @@ class ShellyObj():
 
     async def read_em(self) -> int:
         """ Polls Shelly EM and returns status."""
-
         url = str(stgs.Shelly.em0_url)
         if not url:
             return False
@@ -430,10 +406,11 @@ class ShellyObj():
         self.ev_power = power
 
         return
+#  End of Shelly() class
 
-class EnvObj:
+
+class Env:
     """Stores environmental info - weather, CO2, etc., with async updates."""
-
     def __init__(self):
         self.co2_intensity: int = 200
         self.temp_deg_c: float = 15.0
@@ -442,8 +419,7 @@ class EnvObj:
         self._lock = asyncio.Lock()
 
     async def update_co2(self):
-        """Asynchronously import and analyze CO2 intensity data."""
-
+        """Asynchronously import and extract CO2 intensity data."""
         url = f"{stgs.CarbonIntensity.url.rstrip('/')}/{stgs.CarbonIntensity.PostCode}"
 
         headers = {'Accept': 'application/json'}
@@ -454,16 +430,10 @@ class EnvObj:
                 resp.raise_for_status()
                 data = resp.json()
 
-            # Navigates the Carbon Intensity API response to retrieve forecast intensity value.
-                # data['data'] is a list of regions
-                # [0] gets the first region
-                # ['data'] inside that is a list of half-hour slots
-                # [0] gets the first slot
-                # ['intensity']['forecast'] is the value 53
+                # Navigates the Carbon Intensity API response to get forecast intensity value.
                 self.co2_intensity = data['data'][0]['data'][0]['intensity']['forecast']
 
                 logger.info(f"CO2 Updated: {self.co2_intensity}g/kWh")
-
                 return
 
             except (httpx.HTTPError, KeyError, ZeroDivisionError) as error:
@@ -493,72 +463,140 @@ class EnvObj:
 
             except (httpx.HTTPError, KeyError) as error:
                 logger.error(f"Error obtaining weather data: {error}")
+# End of Env() class
 
-# # End of EnvObj
+
+class BatteryState(Enum):
+    """State Definitions for BatteryManager"""
+    ECO_OPTIMISE = auto()      # Standard self-consumption mode
+    GRID_CHARGE = auto()       # Forced charging (off-peak or low carbon)
+    EV_PROTECT = auto()        # Halt discharge while EV is drawing high power
+    WINTER_BOOST = auto()      # Active grid charge during winter EV load (Aligned to 00/30)
+    PEAK_SHAVE = auto()        # Discharge to cap grid import during expensive peaks
+    EMERGENCY_RESERVE = auto() # Hold charge due to grid instability/storm
 
 
-class EventsObj:
-    """Definitions used to trigger events each minute in scheduler. Less messy this way """
+class BatteryManager:
+    """State machine to control battery and other outputs"""
+    def __init__(self, inverter, shelly):
+        self.inverter = inverter
+        self.shelly = shelly
+        self.current_state = BatteryState.ECO_OPTIMISE
+        self.last_state = None
 
-    def __init__(self):
-        self.shoulder: bool = False
-        self.winter: bool = False
-        self.off_pk: bool = False
-        self.off_pk_start: bool = False
-        self.off_pk_ending: bool = False
-        self.off_pk_end: bool = False
-        self.am_export_finish = False
-        self.pm_export_start = False
-        self.pm_boost_start: bool = False
-        self.pm_boost_end: bool = False
-        self.update_pv_fcast: bool = False
-        self.update_soc: bool = False
-        self.update_soc_pass_2: bool = False
-        self.update_carbon_intensity: bool = False
-        self.update_weather: bool = False
+        # Configuration thresholds
+        self.EV_POWER_THRESHOLD = 3000  # Watts
 
-    def update(self):
-        """Values are updated every minute for use by main code loop"""
-        t_now = stgs.pg.t_now_mins
-        t_plus_hr = t_now + 60 % 1440
+        # Winter Boost Logic
+        self.boost_expiry = None
 
-        self.shoulder = stgs.pg.month in stgs.GE.shoulder
-        self.winter = stgs.pg.month in stgs.GE.winter
+    def is_winter(self):
+        """Checks if current date falls within the defined winter months."""
+        return datetime.now().month in stgs.GE.winter
 
-        if stgs.GE.start_time != "" and stgs.GE.end_time != "":
-            # Is current time within off-peak window? Needs to consider spanning midnight
-            self.off_pk_start = t_to_mins(stgs.GE.start_time) == t_now
-            self.off_pk = t_to_mins(stgs.GE.start_time) <= t_now < t_to_mins(stgs.GE.end_time) or \
-                t_now >= t_to_mins(stgs.GE.start_time) > t_to_mins(stgs.GE.end_time) or \
-                t_to_mins(stgs.GE.start_time) > t_to_mins(stgs.GE.end_time) > t_now
+    def is_shoulder(self):
+        """Checks if current date falls within the defined winter months."""
+        return datetime.now().month in stgs.GE.shoulder
 
-        if stgs.GE.end_time != "" and stgs.GE.end_time_winter != "":
-            # Flag 1 hour before end of off-peak
-            self.off_pk_ending = self.winter is True and \
-                t_plus_hr == t_to_mins(stgs.GE.end_time_winter) or \
-                self.winter is False and t_plus_hr == t_to_mins(stgs.GE.end_time)
-            # Flag at end of off-peak
-            self.off_pk_end = \
-                self.winter is True and t_now == t_to_mins(stgs.GE.end_time_winter) or \
-                self.winter is False and t_now == t_to_mins(stgs.GE.end_time)
+    def is_off_peak(self):
+        """Checks if current time is in off peak period. Allows for spanning midnight. """
+        t_now = t_to_mins(time.strftime("%H:%M", time.localtime()))
+        return t_to_mins(stgs.GE.start_time) <= t_now < t_to_mins(stgs.GE.end_time) or \
+            t_now >= t_to_mins(stgs.GE.start_time) > t_to_mins(stgs.GE.end_time) or \
+            t_to_mins(stgs.GE.start_time) > t_to_mins(stgs.GE.end_time) > t_now
 
-        # Agile Export triggers (morning & evening)
-        if stgs.GE.am_export_finish != "":
-            self.am_export_finish = t_now == t_to_mins(stgs.GE.am_export_finish) and \
-            self.winter is False and self.shoulder is False
+    def is_pm_export(self):
+        """Agile Export trigger (evening)"""
         if stgs.GE.pm_export_start != "":
-            self.pm_export_start = t_now == t_to_mins(stgs.GE.pm_export_start)
+            t_now = t_to_mins(time.strftime("%H:%M", time.localtime()))
+            return self.inverter.soc > 50 and t_now == t_to_mins(stgs.GE.pm_export_start)
 
-        # Update carbon intensity and weather every 15 mins
-        self.update_carbon_intensity = \
-            stgs.CarbonIntensity.enable is True and stgs.pg.loop_counter % 15 == 1
-        self.update_weather = \
-            stgs.OpenWeatherMap.enable is True and stgs.pg.loop_counter % 15 == 1
+    def calculate_aligned_expiry(self, now):
+        """ Calculates expiry time that ends on the next :00 or :30 boundary. """
+        # Calculate minutes until the next half-hour mark (00 or 30)
+        minutes_to_next_boundary = 30 - (now.minute % 30)
 
-# End of EventsObj
+        expiry = now + timedelta(minutes=minutes_to_next_boundary)
+        # Strip seconds and microseconds for a clean boundary
+        return expiry.replace(second=0, microsecond=0)
+
+    async def update(self):
+        """ Determines next state from changes to inputs and triggers inverter commands """
+        t_now = datetime.now()
+
+        # 1. Determine Target State (Priority Logic)
+        new_state = BatteryState.ECO_OPTIMISE  # Default baseline
+
+        # Check if we are currently in a Winter Boost
+        if self.boost_expiry and t_now < self.boost_expiry:
+            new_state = BatteryState.WINTER_BOOST
+
+        # If not already boosting, check if we should start a new Winter Boost
+        elif self.is_winter() and not self.is_off_peak() and \
+            self.inverter.aux_ev_power > self.EV_POWER_THRESHOLD and \
+                t_now.minute % 30 < 20:
+            self.boost_expiry = self.calculate_aligned_expiry(t_now)
+            logging.info(f"EV load detected. Initiating Winter Boost {self.boost_expiry.strftime('%H:%M')}")
+            new_state = BatteryState.WINTER_BOOST
+
+        # Standard logic if no boost is active
+        # elif self.is_off_peak():
+        #     new_state = BatteryState.GRID_CHARGE
+
+        elif not self.is_winter() and not self.is_off_peak() and \
+            self.inverter.aux_ev_power > self.EV_POWER_THRESHOLD and \
+                t_now.minute % 30 < 20:
+            # Summer/Spring behaviour: just pause discharge
+            new_state = BatteryState.EV_PROTECT
+
+        elif self.is_pm_export():
+            new_state = BatteryState.PEAK_SHAVE
+
+        # Clear expiry if we are no longer in boost and time has passed
+        if self.boost_expiry and t_now >= self.boost_expiry:
+            logging.info("Winter Boost period completed.")
+            # Turn off heating if needed
+            if await self.shelly.read_switch(stgs.Shelly.sw1_url) == "On":
+                logging.info("Turning off heating.")
+                asyncio.create_task(self.shelly.set_switch(stgs.Shelly.sw1_url, False))
+            self.boost_expiry = None
+
+        # 2. Handle State Transitions
+        if new_state != self.current_state:
+            await self.transition_to(new_state)
+
+    async def transition_to(self, target_state):
+        """Executes the specific inverter commands for the new state."""
+        logging.info(f"Transitioning: {self.current_state.name} -> {target_state.name}")
+
+        try:
+            if target_state == BatteryState.WINTER_BOOST:
+                if self.inverter.aux_temp < 15:  # Force heating on
+                    logging.info("Turning off heating.")
+                    asyncio.create_task(self.shelly.set_switch(stgs.Shelly.sw1_url, True))
+                # Command grid charge
+                await self.inverter.set_mode("charge_now")
+
+            elif target_state == BatteryState.GRID_CHARGE:
+                await self.inverter.set_mode("charge_now")
+
+            elif target_state == BatteryState.EV_PROTECT:
+                await self.inverter.set_mode("pause_discharge")
+
+            elif target_state == BatteryState.ECO_OPTIMISE:
+                await self.inverter.set_mode("play")
+
+            elif target_state == BatteryState.PEAK_SHAVE:
+                await self.inverter.set_mode("discharge_now")
+
+            self.last_state = self.current_state
+            self.current_state = target_state
+
+        except Exception as e:
+            logging.error(f"Failed to transition to {target_state.name}: {e}")
 
 
-# --- Utility Functions ---
+# Utility Functions
 def t_to_mins(time_str: str) -> int:
     """Safe conversion to mins after midnight with validation."""
     if not time_str or not isinstance(time_str, str):
@@ -576,21 +614,16 @@ def t_to_hrs_raw(mins: int) -> int:
     mins = max(0, min(mins, 1439)) # Clamp to 23:59
     return int(f"{mins // 60:02d}{mins % 60:02d}")
 
-# --- Main Supervisor ---
-
 async def main():
     """Main loop"""
-    # Inverter interface
-    inverter = GivEnergyObjLocal()
 
-    # Shelly switches and energy monitor for EV charging
-    shelly = ShellyObj()
+    inverter = GivEnergyLocal()  # Inverter interface
 
-    # Misc environmental data: weather, CO2, etc
-    env_obj: EnvObj = EnvObj()
+    shelly = Shelly()  # Shelly switches and energy monitor for EV charging
 
-    # Initialise event semaphores
-    events: EventsObj = EventsObj()
+    manager = BatteryManager(inverter, shelly)  # Battery manager state machine
+
+    env_obj: Env = Env()  # Misc environmental data: weather, CO2, etc
 
     stop_event = asyncio.Event()
 
@@ -601,65 +634,117 @@ async def main():
 
     logger.info("PALM v2 Service Started")
 
-    # await inverter.set_mode("play")
-
-    counter = 0
+    loop_counter = 0
     while not stop_event.is_set():
 
-        # post_time: str = time.strftime("%d-%m-%Y %H:%M:%S %z", time.localtime())
-
-        # Schedule activities at specific intervals
-        events.update()
-
-        if events.update_carbon_intensity is True:
+        # Update carbon intensity and weather every 15 mins
+        if stgs.CarbonIntensity.enable is True and loop_counter % 15 == 0:
             asyncio.create_task(env_obj.update_co2())
 
-        if events.update_weather is True:
+        if stgs.OpenWeatherMap.enable is True and loop_counter % 15 == 0:
             asyncio.create_task(env_obj.update_weather_curr())
 
         # Read EV power meter
         await shelly.read_em()
 
-        # Fudges to get all parameters into PVOutput
-        inverter.aux_ev_power = shelly.ev_power
-        inverter.aux_co2: int = env_obj.co2_intensity
-        inverter.aux_temp: int = env_obj.temp_deg_c
+        # Read status of Shelly switch (example only)
+        # switch = await shelly.read_switch(stgs.Shelly.sw1_url)
+        # print("Switch status:", switch)
+        # if switch == "Off":
+        #     asyncio.create_task(shelly.set_switch(stgs.Shelly.sw1_url, True))
 
         # Fetch inverter data
         await inverter.get_latest_data()
 
-        # print(f"{post_time} Cycle: {counter}")
-        # print(inverter.__dict__)
-        # print()
+        # Combine all other parameters
+        inverter.aux_ev_power = shelly.ev_power
+        inverter.aux_co2: int = env_obj.co2_intensity
+        inverter.aux_temp: int = env_obj.temp_deg_c
 
-        # if ev_active:
-            # await set_shelly_switch(stgs.Shelly.switch_url, True)
+        if not stgs.pg.execute_mode:
+            # Run state machine to control inverter
+            await manager.update()
+        else:  # Single shot command
+            await inverter.set_mode(stgs.pg.mode_cmd)
 
-        # Publish data to PVOutput.org
-        if stgs.PVOutput.enable is True and counter % 5 == 4:
-            # Fire and forget in the background
+        # Publish data to PVOutput.org. Fire and forget in the background
+        if stgs.PVOutput.enable is True and loop_counter % 5 == 4:
             snapshot = inverter.__dict__.copy()
-            asyncio.create_task(put_pv_output(snapshot))
+            asyncio.create_task(pvoutput_put(snapshot))
 
-        # Sleep until next minute rollover (non-blocking)
-        current_minute = int(time.strftime("%M", time.localtime()))
-        while int(time.strftime("%M", time.localtime())) == current_minute:
+        # Once mode
+        if stgs.pg.once_mode is True:
+            post_time: str = time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime())
+            print(f"{post_time} Cycle: {loop_counter}")
+            pprint(inverter.__dict__)
+            break
+
+        # Loop timer
+        if stgs.pg.test_mode is False:  # Sleep until next minute rollover (non-blocking)
+            current_minute = int(time.strftime("%M", time.localtime()))
+            while int(time.strftime("%M", time.localtime())) == current_minute:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+        else:  # Test mode. 15 second loop
+            post_time: str = time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime())
+            print(f"{post_time} Cycle: {loop_counter}")
+            pprint(inverter.__dict__)
+            print()
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+                await asyncio.wait_for(stop_event.wait(), timeout=15.0)
             except asyncio.TimeoutError:
                 pass
 
         # Reset frame counter every 24 hours
         if t_to_mins(time.strftime("%H:%M", time.localtime())) == 0:
-            counter = 1
+            loop_counter = 1
         else:
-            counter += 1
-        stgs.pg.loop_counter = counter
+            loop_counter += 1
 
     await inverter.close_connection()
     logger.info("PALM v2 Service Stopped Cleanly")
 
+
 if __name__ == '__main__':
+    # Parse any command-line arguments
+    MESSAGE: str = ""
+
+    if len(sys.argv) > 1:
+        if str(sys.argv[1]) in ["-t", "--test"]:
+            stgs.pg.test_mode = True
+            stgs.pg.debug_mode = True
+            MESSAGE = "Running in test mode..."
+        elif str(sys.argv[1]) in ["-d", "--debug"]:
+            stgs.pg.debug_mode = True
+            MESSAGE = "Running in debug mode, extra verbose"
+        elif str(sys.argv[1]) in ["-o", "--once"]:
+            stgs.pg.once_mode = True
+            MESSAGE = "Running in once mode..."
+        elif str(sys.argv[1]) in ["-x", "--execute"]:
+            stgs.pg.once_mode = True
+            stgs.pg.execute_mode = True
+            stgs.pg.mode_cmd = str(sys.argv[2])
+            MESSAGE = "Executing inverter command: "+ stgs.pg.mode_cmd
+
+    if stgs.pg.debug_mode is True:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("PALM")
+
+    logger.critical("PALM... PV Automated Load Manager Version: "+ PALM_VERSION)
+    logger.critical("Command line options (only one can be used):")
+    logger.critical("-t | --test  | test mode (4x speed, no external server writes)")
+    logger.critical("-d | --debug | debug mode, extra verbose")
+    logger.critical("-o | --once  | once mode, reports inverter status and then exit")
+    logger.critical("-x | --execute [charge_now | discharge_now | pause | play] | run inverter command and exit")
+    logger.critical("")
+    if MESSAGE != "":
+        logger.critical(MESSAGE)
+        logger.critical("")
+
     try:
         asyncio.run(main())
     except Exception as e:

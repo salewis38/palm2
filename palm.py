@@ -42,19 +42,6 @@ PALM_VERSION = "v2.0.1"
 # pylint: disable=consider-using-f-string
 # pylint: disable=logging-fstring-interpolation
 
-# Enhanced logging
-logging.basicConfig(
-    format='%(asctime)s %(levelname)-8s %(message)s',
-    level=logging.INFO,
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-
-# Set the logger for 'httpx' to WARNING to ignore INFO and DEBUG logs
-httpx_logger = logging.getLogger("httpx")
-httpx_logger.setLevel(logging.WARNING)
-
-
 class GivEnergyLocal:
     """Class for GivEnergy inverter (local access) with robust sync."""
 
@@ -581,7 +568,7 @@ class BatteryManager:
                 await self.inverter.set_mode("charge_now")
 
             elif target_state == BatteryState.EV_PROTECT:
-                await self.inverter.set_mode("pause_discharge")
+                await self.inverter.set_mode("pause")
 
             elif target_state == BatteryState.ECO_OPTIMISE:
                 await self.inverter.set_mode("play")
@@ -727,6 +714,18 @@ if __name__ == '__main__':
             stgs.pg.execute_mode = True
             stgs.pg.mode_cmd = str(sys.argv[2])
             MESSAGE = "Executing inverter command: "+ stgs.pg.mode_cmd
+
+    # Enhanced logging
+    logging.basicConfig(
+        format='%(asctime)s %(levelname)-8s %(message)s',
+        level=logging.INFO,
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
+
+    # Set the logger for 'httpx' to WARNING to ignore INFO and DEBUG logs
+    httpx_logger = logging.getLogger("httpx")
+    httpx_logger.setLevel(logging.WARNING)
 
     if stgs.pg.debug_mode is True:
         logging.basicConfig(level=logging.DEBUG)

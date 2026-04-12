@@ -68,7 +68,7 @@ class GivEnergyLocal:
         self.last_update_success = False
         self._client = None
         self._lock = asyncio.Lock()
-        self._consecutive_failures = 0
+        self._consecutive_fails = 0
         self.MAX_FAILURES = 3
 
     async def _get_client(self):
@@ -101,10 +101,10 @@ class GivEnergyLocal:
 
     async def get_latest_data(self):
         """Fetch inverter data."""
-        if self._consecutive_failures >= self.MAX_FAILURES:
+        if self._consecutive_fails >= self.MAX_FAILURES:
             logger.warning("Cooling down due to consecutive failures...")
             await asyncio.sleep(30)
-            self._consecutive_failures = 0
+            self._consecutive_fails = 0
 
         async with self._lock:
             try:
@@ -122,15 +122,15 @@ class GivEnergyLocal:
                 if inverter and self._is_data_sane(inverter):
                     self._update_internal_state(inverter)
                     self.last_update_success = True
-                    self._consecutive_failures = 0
+                    self._consecutive_fails = 0
                     # logger.info("Inverter data updated.")
                 else:
                     raise ValueError("Inverter data failed sanity check")
 
             except (asyncio.TimeoutError, Exception) as e:
-                self._consecutive_failures += 1
+                self._consecutive_fails += 1
                 self.last_update_success = False
-                logger.error(f"Read failure ({self._consecutive_failures}/{self.MAX_FAILURES}): {e}")
+                logger.error(f"Read failure ({self._consecutive_fails}/{self.MAX_FAILURES}): {e}")
                 await self.close_connection()
 
     def _update_internal_state(self, inv):
@@ -420,7 +420,7 @@ class Env:
                 # Navigates the Carbon Intensity API response to get forecast intensity value.
                 self.co2_intensity = data['data'][0]['data'][0]['intensity']['forecast']
 
-                logger.info(f"CO2 Updated: {self.co2_intensity}g/kWh")
+                logger.info(f"CO2: {self.co2_intensity}g/kWh")
                 return
 
             except (httpx.HTTPError, KeyError, ZeroDivisionError) as error:
@@ -439,14 +439,17 @@ class Env:
 
                 self.current_weather = data
                 # Convert Kelvin to Celsius (273.15 is the precise offset)
-                raw_temp = data.get('current', {}).get('temp', 288.15)
-                self.temp_deg_c = round(raw_temp - 273.15, 1)
+                raw_temp = float(data.get('current', {}).get('temp'))
+                t = round(raw_temp - 273.15, 1)
+                # Bound check:
+                if -20 < t < 50:
+                    self.temp_deg_c = t
 
                 # Fetch weather ID symbol
                 weather_info = data.get('current', {}).get('weather', [{}])
                 self.weather_symbol = str(weather_info[0].get('id', '0'))
 
-                logger.info(f"Weather Updated: {self.temp_deg_c}°C, Symbol ID: {self.weather_symbol}")
+                logger.info(f"Weather: {self.temp_deg_c}°C, Symbol ID: {self.weather_symbol}")
 
             except (httpx.HTTPError, KeyError) as error:
                 logger.error(f"Error obtaining weather data: {error}")
@@ -493,10 +496,12 @@ class BatteryManager:
             t_to_mins(stgs.GE.start_time) > t_to_mins(stgs.GE.end_time) > t_now
 
     def is_pm_export(self):
-        """Agile Export trigger (evening)"""
-        if stgs.GE.pm_export_start != "":
+        """Agile Export trigger (evening). Active in warmer months only if SoC > 50%"""
+        if stgs.GE.pm_export_start != "" and not self.is_winter():
             t_now = t_to_mins(time.strftime("%H:%M", time.localtime()))
-            return self.inverter.soc > 50 and t_now == t_to_mins(stgs.GE.pm_export_start)
+            return self.inverter.soc > 50 and \
+                (self.inverter.aux_temp > 14 and t_now == t_to_mins(stgs.GE.pm_export_start) or \
+                self.current_state == BatteryState.PEAK_SHAVE)
 
     def calculate_aligned_expiry(self, now):
         """ Calculates expiry time that ends on the next :00 or :30 boundary. """
@@ -523,7 +528,7 @@ class BatteryManager:
             self.inverter.aux_ev_power > self.EV_POWER_THRESHOLD and \
                 t_now.minute % 30 < 20:
             self.boost_expiry = self.calculate_aligned_expiry(t_now)
-            logging.info(f"EV load detected. Initiating Winter Boost {self.boost_expiry.strftime('%H:%M')}")
+            logging.info(f"EV load detected. Starting Boost {self.boost_expiry.strftime('%H:%M')}")
             new_state = BatteryState.WINTER_BOOST
 
         # Standard logic if no boost is active
@@ -559,7 +564,7 @@ class BatteryManager:
         try:
             if target_state == BatteryState.WINTER_BOOST:
                 if self.inverter.aux_temp < 15:  # Force heating on
-                    logging.info("Turning off heating.")
+                    logging.info("Turning on heating...")
                     asyncio.create_task(self.shelly.set_switch(stgs.Shelly.sw1_url, True))
                 # Command grid charge
                 await self.inverter.set_mode("charge_now")
@@ -735,10 +740,10 @@ if __name__ == '__main__':
 
     logger.critical("PALM... PV Automated Load Manager Version: "+ PALM_VERSION)
     logger.critical("Command line options (only one can be used):")
-    logger.critical("-t | --test  | test mode (4x speed, no external server writes)")
-    logger.critical("-d | --debug | debug mode, extra verbose")
-    logger.critical("-o | --once  | once mode, reports inverter status and then exit")
-    logger.critical("-x | --execute [charge_now | discharge_now | pause | play] | run inverter command and exit")
+    logger.critical("-t | --test  : test mode (4x speed, no external server writes)")
+    logger.critical("-d | --debug : debug mode, extra verbose")
+    logger.critical("-o | --once  : once mode, reports inverter status and then exit")
+    logger.critical("-x | --execute [charge_now | discharge_now | pause | play] : run single command")
     logger.critical("")
     if MESSAGE != "":
         logger.critical(MESSAGE)

@@ -190,8 +190,8 @@ class GivEnergyLocal:
                     verify_target = ("enable_charge", True)
 
                 elif cmd == "discharge_now":
-                    await client.execute(cmds.set_charge_slot_1_start(0),2.0,2)
-                    await client.execute(cmds.set_charge_slot_1_end(2359),2.0,2)
+                    await client.execute(cmds.set_discharge_slot_1_start(0),2.0,2)
+                    await client.execute(cmds.set_discharge_slot_1_end(2359),2.0,2)
                     await client.execute(cmds.set_enable_discharge(True),2.0,2)
                     await client.execute(cmds.set_enable_charge(False),2.0,2)
                     verify_target = ("enable_charge", False)
@@ -658,6 +658,7 @@ async def main():
             await manager.update()
         else:  # Single shot command
             await inverter.set_mode(stgs.pg.mode_cmd)
+            await inverter.get_latest_data()  # Repeat after command executed
 
         # Publish data to PVOutput.org. Fire and forget in the background
         if stgs.PVOutput.enable is True and loop_counter % 5 == 4:

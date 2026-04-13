@@ -7,4 +7,33 @@ The original PALM served two main purposes:  PV export reduction through regulat
 * Automatic upload of consumption data and other parameters to PVOutput.org for visualisation and long-term analysis
 * Monitoring of EV charging (agnostic of EVSE type via a Shelly Energy Monitor), enabling appropriate battery control and control of other loads via Shelly switches
 * Controlled battery export during summer evenings
-* Enabling other battery control use cases through a set of library calls  
+* Enabling other battery control use cases through a set of library calls
+* 
+
+**INSTALLATION INSTRUCTIONS FOR LINUX-BASED SYSTEMS, INCLUDING HOW TO RUN AS A SERVICE ON RASPBERRY PI**
+
+Create local directories:
+$ mkdir /home/pi/palm
+$ mkdir /home/pi/logs
+
+Download all files to /home/pi/palm/
+$ cd /home/pi/palm
+$ wget github.com/salewis38/palm/archive/heads/main.zip
+$ unzip main.zip
+$ cp -rp palm-heads-main/* ./
+
+Edit palm_settings.py with your system details, etc
+$ nano palm_settings.py
+
+Run palm.py, initially in test mode with the command:
+$ ./palm.py -t
+
+To run as a persistent service, execute the following commands:
+$ sudo cp palm.service /lib/systemd/system
+$ sudo systemctl start palm.service
+$ sudo systemctl enable palm.service
+
+This will run palm.py in the background and save date-coded logfiles to /home/pi/logs
+
+Enjoy!
+

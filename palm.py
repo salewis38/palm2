@@ -42,6 +42,7 @@ PALM_VERSION = "v2.0.1"
 # pylint: disable=consider-using-f-string
 # pylint: disable=logging-fstring-interpolation
 
+
 class GivEnergyLocal:
     """Class for GivEnergy inverter (local access) with robust sync."""
 
@@ -151,7 +152,7 @@ class GivEnergyLocal:
         self.e_battery_discharge_total = int(inv.e_battery_discharge_total * 1000)
 
         # Grid energy calculation for PVOutput
-        self.grid_energy = round(max(int((inv.e_grid_in_day - inv.e_grid_out_day) * 1000), 0),2)
+        self.grid_energy = round(max(int((inv.e_grid_in_day - inv.e_grid_out_day) * 1000), 0), 2)
 
     async def set_mode(self, cmd: str):
         """Executes inverter control commands with persistence and locking."""
@@ -174,48 +175,51 @@ class GivEnergyLocal:
                 verify_target = None  # Used to read-back last command in a sequence
 
                 if cmd == "charge_now":
-                    await client.execute(cmds.set_charge_slot_1_start(0),2.0,2)
-                    await client.execute(cmds.set_charge_slot_1_end(2359),2.0,2)
-                    await client.execute(cmds.set_enable_discharge(False),2.0,2)
-                    await client.execute(cmds.set_charge_target(100),2.0,2)
-                    await client.execute(cmds.set_enable_charge(True),2.0,2)
+                    await client.execute(cmds.set_charge_slot_1_start(0), 2.0, 2)
+                    await client.execute(cmds.set_charge_slot_1_end(2359), 2.0, 2)
+                    await client.execute(cmds.set_enable_discharge(False), 2.0, 2)
+                    await client.execute(cmds.set_charge_target(100), 2.0, 2)
+                    await client.execute(cmds.set_enable_charge(True), 2.0, 2)
                     verify_target = ("enable_charge", True)
 
                 elif cmd == "charge_now_soc":
-                    await client.execute(cmds.set_charge_slot_1_start(0),2.0,2)
-                    await client.execute(cmds.set_charge_slot_1_end(2359),2.0,2)
-                    await client.execute(cmds.set_enable_discharge(False),2.0,2)
-                    await client.execute(cmds.set_charge_target(self.tgt_soc),2.0,2)
-                    await client.execute(cmds.set_enable_charge(True),2.0,2)
+                    await client.execute(cmds.set_charge_slot_1_start(0), 2.0, 2)
+                    await client.execute(cmds.set_charge_slot_1_end(2359), 2.0, 2)
+                    await client.execute(cmds.set_enable_discharge(False), 2.0, 2)
+                    await client.execute(cmds.set_charge_target(self.tgt_soc), 2.0, 2)
+                    await client.execute(cmds.set_enable_charge(True), 2.0, 2)
                     verify_target = ("enable_charge", True)
 
                 elif cmd == "discharge_now":
-                    await client.execute(cmds.set_discharge_slot_1_start(0),2.0,2)
-                    await client.execute(cmds.set_discharge_slot_1_end(2359),2.0,2)
-                    await client.execute(cmds.set_enable_discharge(True),2.0,2)
-                    await client.execute(cmds.set_enable_charge(False),2.0,2)
+                    await client.execute(cmds.set_discharge_slot_1_start(1), 2.0, 2)
+                    await client.execute(cmds.set_discharge_slot_1_end(2359), 2.0, 2)
+                    await client.execute(cmds.set_enable_discharge(True), 2.0, 2)
+                    await client.execute(cmds.set_enable_charge(False), 2.0, 2)
                     verify_target = ("enable_charge", False)
 
-                elif cmd == "pause":
-                    await client.execute(cmds.set_enable_discharge(False),2.0,2)
-                    await client.execute(cmds.set_battery_discharge_limit(0),2.0,2)
-                    await client.execute(cmds.set_enable_charge(False),2.0,2)
-                    verify_target = ("enable_charge", False)
+                elif cmd == "pause":  # pause register settings: 0 = run, 3 = pause
+                    await client.execute(cmds.set_battery_pause_mode(3), 2.0, 2)
+                    verify_target = ("battery_pause_mode", 3)
+
+                elif cmd == "end_pause":  # pause register settings: 0 = run, 3 = pause
+                    await client.execute(cmds.set_battery_pause_mode(0), 2.0, 2)
+                    verify_target = ("battery_pause_mode", 0)
 
                 elif cmd == "play":
-                    await client.execute(cmds.set_charge_slot_1_start(2330),2.0,2)
-                    await client.execute(cmds.set_charge_slot_1_end(530),2.0,2)
-                    await client.execute(cmds.set_discharge_slot_1_start(1),2.0,2)
-                    await client.execute(cmds.set_discharge_slot_1_end(2359),2.0,2)
-                    await client.execute(cmds.set_charge_target(100),2.0,2)
-                    await client.execute(cmds.set_battery_discharge_limit(29),2.0,2)
-                    await client.execute(cmds.set_enable_discharge(False),2.0,2)
-                    await client.execute(cmds.set_enable_charge(True),2.0,2)
-                    verify_target = ("enable_charge", True)
+                    await client.execute(cmds.set_charge_slot_1_start(2330), 2.0, 2)
+                    await client.execute(cmds.set_charge_slot_1_end(530), 2.0, 2)
+                    await client.execute(cmds.set_discharge_slot_1_start(1), 2.0, 2)
+                    await client.execute(cmds.set_discharge_slot_1_end(2359), 2.0, 2)
+                    await client.execute(cmds.set_charge_target(100), 2.0, 2)
+                    await client.execute(cmds.set_battery_discharge_limit(29), 2.0, 2)
+                    await client.execute(cmds.set_enable_discharge(False), 2.0, 2)
+                    await client.execute(cmds.set_enable_charge(True), 2.0, 2)
+                    await client.execute(cmds.set_battery_pause_mode(0), 2.0, 2)
+                    verify_target = ("battery_pause_mode", 0)
 
                 elif cmd == "set_soc":
-                    await client.execute(cmds.set_charge_target(self.tgt_soc),2.0,2)
-                    await client.execute(cmds.enable_charge_target(True),2.0,2)
+                    await client.execute(cmds.set_charge_target(self.tgt_soc), 2.0, 2)
+                    await client.execute(cmds.enable_charge_target(True), 2.0, 2)
                     verify_target = ("enable_charge_target", True)
 
                 else:
@@ -224,7 +228,7 @@ class GivEnergyLocal:
                 if verify_target:
                     attr, expected = verify_target
                     for attempt in range(1, 4):
-                        await asyncio.sleep(2) # Give the inverter time to process
+                        await asyncio.sleep(2)  # Give the inverter time to process
                         await client.refresh_plant(full_refresh=False)
 
                         # Get actual value from the inverter object
@@ -262,43 +266,43 @@ async def pvoutput_put(data_snapshot: dict):
         batt_power_in = -1 * data_snapshot.get('batt_power', 0)
 
     payload = {
-        "d"  : post_date,
+        "d":   post_date,
         "key": stgs.PVOutput.key,
         "sid": stgs.PVOutput.sid,
-        "v2" : data_snapshot.get('pv_power', 0),
-        "v4" : data_snapshot.get('consumption', 0),
-        "v5" : data_snapshot.get('aux_temp', 0),
-        "v6" : data_snapshot.get('line_voltage', 0),
-        "v7" : data_snapshot.get('aux_ev_power',0),
-        "v8" : batt_power_out,
-        "v9" : data_snapshot.get('aux_co2',0),
-        "v10": int(data_snapshot.get('aux_co2',0) * data_snapshot.get('consumption', 0)),
+        "v2":  data_snapshot.get('pv_power', 0),
+        "v4":  data_snapshot.get('consumption', 0),
+        "v5":  data_snapshot.get('aux_temp', 0),
+        "v6":  data_snapshot.get('line_voltage', 0),
+        "v7":  data_snapshot.get('aux_ev_power', 0),
+        "v8":  batt_power_out,
+        "v9":  data_snapshot.get('aux_co2', 0),
+        "v10": int(data_snapshot.get('aux_co2', 0) * data_snapshot.get('consumption', 0)),
         "v11": batt_power_in,
         "v12": data_snapshot.get('line_frequency', 0),
-        "b1" : data_snapshot.get('batt_power', 0) * -1,
-        "b2" : data_snapshot.get('soc', 0),
-        "b3" : int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation *1000),
-        "b4" : data_snapshot.get('e_battery_charge_total', 0),
-        "b5" : data_snapshot.get('e_battery_discharge_total', 0)
+        "b1":  data_snapshot.get('batt_power', 0) * -1,
+        "b2":  data_snapshot.get('soc', 0),
+        "b3":  int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation *1000),
+        "b4":  data_snapshot.get('e_battery_charge_total', 0),
+        "b5":  data_snapshot.get('e_battery_discharge_total', 0)
     }
 
     # Legacy part_payload. Now only used for logging
     part_payload = {
-        "v2" : data_snapshot.get('pv_power', 0),
-        "v4" : data_snapshot.get('consumption', 0),
-        "v5" : data_snapshot.get('aux_temp', 0),
-        "v6" : data_snapshot.get('line_voltage', 0),
-        "v7" : data_snapshot.get('aux_ev_power',0),
-        "v8" : batt_power_out,
-        "v9" : data_snapshot.get('aux_co2',0),
-        "v10": int(data_snapshot.get('aux_co2',0) * data_snapshot.get('consumption', 0)),
+        "v2":  data_snapshot.get('pv_power', 0),
+        "v4":  data_snapshot.get('consumption', 0),
+        "v5":  data_snapshot.get('aux_temp', 0),
+        "v6":  data_snapshot.get('line_voltage', 0),
+        "v7":  data_snapshot.get('aux_ev_power', 0),
+        "v8":  batt_power_out,
+        "v9":  data_snapshot.get('aux_co2', 0),
+        "v10": int(data_snapshot.get('aux_co2', 0) * data_snapshot.get('consumption', 0)),
         "v11": batt_power_in,
         "v12": data_snapshot.get('line_frequency', 0),
-        "b1" : data_snapshot.get('batt_power', 0) * -1,
-        "b2" : data_snapshot.get('soc', 0),
-        "b3" : int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation *1000),
-        "b4" : data_snapshot.get('e_battery_charge_total', 0),
-        "b5" : data_snapshot.get('e_battery_discharge_total', 0)
+        "b1":  data_snapshot.get('batt_power', 0) * -1,
+        "b2":  data_snapshot.get('soc', 0),
+        "b3":  int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation *1000),
+        "b4":  data_snapshot.get('e_battery_charge_total', 0),
+        "b5":  data_snapshot.get('e_battery_discharge_total', 0)
     }
 
     # Manually construct URL to prevent httpx from encoding the colon
@@ -310,7 +314,7 @@ async def pvoutput_put(data_snapshot: dict):
         logger.info(f"DRY RUN URL: {final_url}")
         return
 
-    await asyncio.sleep(2) # Rate limit respect
+    await asyncio.sleep(2)  # Rate limit respect
 
     async with httpx.AsyncClient() as client:
         try:
@@ -469,12 +473,12 @@ class Env:
 
 class BatteryState(Enum):
     """State Definitions for BatteryManager"""
-    ECO_OPTIMISE = auto()      # Standard self-consumption mode
-    GRID_CHARGE = auto()       # Forced charging (off-peak or low carbon)
-    EV_PROTECT = auto()        # Halt discharge while EV is drawing high power
-    WINTER_BOOST = auto()      # Active grid charge during winter EV load (Aligned to 00/30)
-    PEAK_SHAVE = auto()        # Discharge to cap grid import during expensive peaks
-    EMERGENCY_RESERVE = auto() # Hold charge due to grid instability/storm
+    ECO_OPTIMISE = auto()       # Standard self-consumption mode
+    GRID_CHARGE = auto()        # Forced charging (off-peak or low carbon)
+    EV_PROTECT = auto()         # Halt discharge while EV is drawing high power
+    WINTER_BOOST = auto()       # Active grid charge during winter EV load (Aligned to 00/30)
+    PEAK_SHAVE = auto()         # Discharge to cap grid import during expensive peaks
+    EMERGENCY_RESERVE = auto()  # Hold charge due to grid instability/storm
 
 
 class BatteryManager:
@@ -508,17 +512,17 @@ class BatteryManager:
 
     def is_pm_export(self):
         """Agile Export trigger (evening). Active in warmer months only if SoC > 50%"""
-        if stgs.GE.pm_export_start != "" and not self.is_winter():
+        if stgs.GE.pm_export_start != "" and not self.is_winter() and self.inverter.aux_temp > 14:
             t_now = t_to_mins(time.strftime("%H:%M", time.localtime()))
-            return self.inverter.soc > 50 and \
-                (self.inverter.aux_temp > 14 and t_now == t_to_mins(stgs.GE.pm_export_start) or \
-                self.current_state == BatteryState.PEAK_SHAVE)
+            return self.inverter.soc > 70 and t_now == t_to_mins(stgs.GE.pm_export_start)
+
+    def is_ev_charging(self):
+        return self.inverter.aux_ev_power > self.EV_POWER_THRESHOLD
 
     def calculate_aligned_expiry(self, now):
         """ Calculates expiry time that ends on the next :00 or :30 boundary. """
         # Calculate minutes until the next half-hour mark (00 or 30)
         minutes_to_next_boundary = 30 - (now.minute % 30)
-
         expiry = now + timedelta(minutes=minutes_to_next_boundary)
         # Strip seconds and microseconds for a clean boundary
         return expiry.replace(second=0, microsecond=0)
@@ -527,41 +531,31 @@ class BatteryManager:
         """ Determines next state from changes to inputs and triggers inverter commands """
         t_now = datetime.now()
 
-        # 1. Determine Target State (Priority Logic)
+        # Default next state (Priority Logic)
         new_state = BatteryState.ECO_OPTIMISE  # Default baseline
 
-        # Check if we are currently in a Winter Boost
-        if self.boost_expiry and t_now < self.boost_expiry:
-            new_state = BatteryState.WINTER_BOOST
+        # If EV is already active extend either boost or pause
+        if self.boost_expiry is True and t_now < self.boost_expiry:
+            new_state = self.current_state
 
-        # If not already boosting, check if we should start a new Winter Boost
-        elif self.is_winter() and not self.is_off_peak() and \
-            self.inverter.aux_ev_power > self.EV_POWER_THRESHOLD and \
+        # If not already boosting, check if we should start a boost or pause
+        elif self.is_ev_charging() is True and self.is_off_peak() is False and \
                 t_now.minute % 30 < 20:
             self.boost_expiry = self.calculate_aligned_expiry(t_now)
-            logging.info(f"EV load detected. Starting Boost {self.boost_expiry.strftime('%H:%M')}")
-            new_state = BatteryState.WINTER_BOOST
+            if self.is_winter() is True:
+                logging.info(f"EV load detected. Starting Boost {self.boost_expiry.strftime('%H:%M')}")
+                new_state = BatteryState.WINTER_BOOST
+            else:  # Summer/Spring behaviour: just pause discharge
+                logging.info(f"EV load detected. Pausing {self.boost_expiry.strftime('%H:%M')}")
+                new_state = BatteryState.EV_PROTECT
 
-        # Standard logic if no boost is active
-        # elif self.is_off_peak():
-        #     new_state = BatteryState.GRID_CHARGE
-
-        elif not self.is_winter() and not self.is_off_peak() and \
-            self.inverter.aux_ev_power > self.EV_POWER_THRESHOLD and \
-                t_now.minute % 30 < 20:
-            # Summer/Spring behaviour: just pause discharge
-            new_state = BatteryState.EV_PROTECT
-
-        elif self.is_pm_export():
+        elif self.is_pm_export() is True or \
+            (self.inverter.soc > 50 and self.current_state == BatteryState.PEAK_SHAVE):
             new_state = BatteryState.PEAK_SHAVE
 
         # Clear expiry if we are no longer in boost and time has passed
-        if self.boost_expiry and t_now >= self.boost_expiry:
-            logging.info("Winter Boost period completed.")
-            # Turn off heating if needed
-            if await self.shelly.read_switch(stgs.Shelly.sw1_url) == "On":
-                logging.info("Turning off heating.")
-                asyncio.create_task(self.shelly.set_switch(stgs.Shelly.sw1_url, False))
+        if self.boost_expiry is True and t_now >= self.boost_expiry:
+            logging.info("Boost period completed.")
             self.boost_expiry = None
 
         # 2. Handle State Transitions
@@ -573,14 +567,26 @@ class BatteryManager:
         logging.info(f"Transitioning: {self.current_state.name} -> {target_state.name}")
 
         try:
+        # First, any closing actions in the current state
+            if self.current_state == BatteryState.WINTER_BOOST:
+                if await self.shelly.read_switch(stgs.Shelly.sw1_url) == "On":
+                    logging.info("Turning off heating.")
+                    asyncio.create_task(self.shelly.set_switch(stgs.Shelly.sw1_url, False))
+
+            elif self.current_state == BatteryState.EV_PROTECT:
+                await self.inverter.set_mode("end_pause")
+
+            # elif self.current_state == BatteryState.ECO_OPTIMISE:
+                # await self.inverter.set_mode("play")
+
+            # elif self.current_state == BatteryState.PEAK_SHAVE:
+                # await self.inverter.set_mode("discharge_now")
+
+        # Then actions for new state
             if target_state == BatteryState.WINTER_BOOST:
                 if self.inverter.aux_temp < 15:  # Force heating on
                     logging.info("Turning on heating...")
                     asyncio.create_task(self.shelly.set_switch(stgs.Shelly.sw1_url, True))
-                # Command grid charge
-                await self.inverter.set_mode("charge_now")
-
-            elif target_state == BatteryState.GRID_CHARGE:
                 await self.inverter.set_mode("charge_now")
 
             elif target_state == BatteryState.EV_PROTECT:
@@ -612,10 +618,12 @@ def t_to_mins(time_str: str) -> int:
     except (ValueError, AttributeError):
         return 0
 
+
 def t_to_hrs_raw(mins: int) -> int:
     """Strict HHMM format integer conversion."""
-    mins = max(0, min(mins, 1439)) # Clamp to 23:59
+    mins = max(0, min(mins, 1439))  # Clamp to 23:59
     return int(f"{mins // 60:02d}{mins % 60:02d}")
+
 
 async def main():
     """Main loop"""
@@ -730,7 +738,7 @@ if __name__ == '__main__':
             stgs.pg.once_mode = True
             stgs.pg.execute_mode = True
             stgs.pg.mode_cmd = str(sys.argv[2])
-            MESSAGE = "Executing inverter command: "+ stgs.pg.mode_cmd
+            MESSAGE = "Executing inverter command: " + stgs.pg.mode_cmd
 
     # Enhanced logging
     logging.basicConfig(
@@ -750,12 +758,12 @@ if __name__ == '__main__':
         logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("PALM")
 
-    logger.critical("PALM... PV Automated Load Manager Version: "+ PALM_VERSION)
+    logger.critical("PALM... PV Automated Load Manager Version: " + PALM_VERSION)
     logger.critical("Command line options (only one can be used):")
     logger.critical("-t | --test  : test mode (4x speed, no external server writes)")
     logger.critical("-d | --debug : debug mode, extra verbose")
     logger.critical("-o | --once  : once mode, reports inverter status and then exit")
-    logger.critical("-x | --execute [charge_now | discharge_now | pause | play] : run single command")
+    logger.critical("-x | --execute [charge_now | discharge_now | end_pause | pause | play] : run single command")
     logger.critical("")
     if MESSAGE != "":
         logger.critical(MESSAGE)

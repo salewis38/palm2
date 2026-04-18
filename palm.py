@@ -34,7 +34,7 @@ from givenergy_modbus.client.client import Client
 
 # Changelog:
 # v2.0.0    10/Apr/26 First version to handle continuous Modbus data collection and control.
-# v2.0.1    10/Apr/26 Added state machine for battery control and CLI settings.
+# v2.0.1    18/Apr/26 Added state machine for battery control and CLI settings.
 
 PALM_VERSION = "v2.0.1"
 # -*- coding: utf-8 -*-
@@ -156,6 +156,10 @@ class GivEnergyLocal:
 
     async def set_mode(self, cmd: str):
         """Executes inverter control commands with persistence and locking."""
+
+        start_time = t_to_hrs_raw(t_to_mins(stgs.GE.start_time))  # Start of off-peak 23:30
+        end_time = t_to_hrs_raw(t_to_mins(stgs.GE.end_time))  # End of off-peak 05:30
+
         if stgs.pg.test_mode:
             logger.info(f"DRY RUN: Setting inverter mode: {cmd}")
             return
@@ -206,16 +210,15 @@ class GivEnergyLocal:
                     verify_target = ("battery_pause_mode", 0)
 
                 elif cmd == "play":
-                    await client.execute(cmds.set_charge_slot_1_start(2330), 2.0, 2)
-                    await client.execute(cmds.set_charge_slot_1_end(530), 2.0, 2)
+                    await client.execute(cmds.set_charge_slot_1_start(start_time), 2.0, 2)
+                    await client.execute(cmds.set_charge_slot_1_end(end_time), 2.0, 2)
                     await client.execute(cmds.set_discharge_slot_1_start(1), 2.0, 2)
                     await client.execute(cmds.set_discharge_slot_1_end(2359), 2.0, 2)
                     await client.execute(cmds.set_charge_target(100), 2.0, 2)
                     await client.execute(cmds.set_battery_discharge_limit(29), 2.0, 2)
                     await client.execute(cmds.set_enable_discharge(False), 2.0, 2)
                     await client.execute(cmds.set_enable_charge(True), 2.0, 2)
-                    await client.execute(cmds.set_battery_pause_mode(0), 2.0, 2)
-                    verify_target = ("battery_pause_mode", 0)
+                    verify_target = ("enable_charge_target", True)
 
                 elif cmd == "set_soc":
                     await client.execute(cmds.set_charge_target(self.tgt_soc), 2.0, 2)
@@ -281,7 +284,7 @@ async def pvoutput_put(data_snapshot: dict):
         "v12": data_snapshot.get('line_frequency', 0),
         "b1":  data_snapshot.get('batt_power', 0) * -1,
         "b2":  data_snapshot.get('soc', 0),
-        "b3":  int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation *1000),
+        "b3":  int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation * 1000),
         "b4":  data_snapshot.get('e_battery_charge_total', 0),
         "b5":  data_snapshot.get('e_battery_discharge_total', 0)
     }
@@ -300,7 +303,7 @@ async def pvoutput_put(data_snapshot: dict):
         "v12": data_snapshot.get('line_frequency', 0),
         "b1":  data_snapshot.get('batt_power', 0) * -1,
         "b2":  data_snapshot.get('soc', 0),
-        "b3":  int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation *1000),
+        "b3":  int(stgs.GE.batt_capacity * stgs.GE.batt_utilisation * 1000),
         "b4":  data_snapshot.get('e_battery_charge_total', 0),
         "b5":  data_snapshot.get('e_battery_discharge_total', 0)
     }
@@ -488,9 +491,11 @@ class BatteryManager:
         self.shelly = shelly
         self.current_state = BatteryState.ECO_OPTIMISE
         self.last_state = None
+        self.ev_pwr_last0:int = 0
+        self.ev_pwr_last1:int = 0
+        self.ev_pwr_last2:int = 0
 
-        # Configuration thresholds
-        self.EV_POWER_THRESHOLD = 3000  # Watts
+        self.ev_power_threshold: int = stgs.GE.ev_power_threshold
 
         # Winter Boost Logic
         self.boost_expiry = None
@@ -512,16 +517,23 @@ class BatteryManager:
 
     def is_pm_export(self):
         """Agile Export trigger (evening). Active in warmer months only if SoC > 50%"""
-        if stgs.GE.pm_export_start != "" and not self.is_winter() and self.inverter.aux_temp > 14:
+        if stgs.GE.pm_export_start != "" and not self.is_winter() and \
+                self.inverter.aux_temp > 14 and self.inverter.aux_co2 > 100:
+
             t_now = t_to_mins(time.strftime("%H:%M", time.localtime()))
-            return self.inverter.soc > 70 and t_now == t_to_mins(stgs.GE.pm_export_start)
+            return (self.inverter.soc > 70 and t_now == t_to_mins(stgs.GE.pm_export_start)) or \
+                (self.inverter.soc > 50 and self.current_state == BatteryState.PEAK_SHAVE)
+        return False
 
     def is_ev_charging(self):
-        return self.inverter.aux_ev_power > self.EV_POWER_THRESHOLD
+        """Detection of EV detection charging above defined threshold for 3 mins"""
+        self.ev_pwr_last2 = self.ev_pwr_last1
+        self.ev_pwr_last1 = self.ev_pwr_last0
+        self.ev_pwr_last0 = self.inverter.aux_ev_power - self.inverter.pv_power
+        return min(self.ev_pwr_last0, self.ev_pwr_last1, self.ev_pwr_last2) > self.ev_power_threshold
 
     def calculate_aligned_expiry(self, now):
         """ Calculates expiry time that ends on the next :00 or :30 boundary. """
-        # Calculate minutes until the next half-hour mark (00 or 30)
         minutes_to_next_boundary = 30 - (now.minute % 30)
         expiry = now + timedelta(minutes=minutes_to_next_boundary)
         # Strip seconds and microseconds for a clean boundary
@@ -538,19 +550,16 @@ class BatteryManager:
         if self.boost_expiry is True and t_now < self.boost_expiry:
             new_state = self.current_state
 
-        # If not already boosting, check if we should start a boost or pause
+        # Check if we should start either a boost or a pause
         elif self.is_ev_charging() is True and self.is_off_peak() is False and \
                 t_now.minute % 30 < 20:
             self.boost_expiry = self.calculate_aligned_expiry(t_now)
             if self.is_winter() is True:
-                logging.info(f"EV load detected. Starting Boost {self.boost_expiry.strftime('%H:%M')}")
                 new_state = BatteryState.WINTER_BOOST
             else:  # Summer/Spring behaviour: just pause discharge
-                logging.info(f"EV load detected. Pausing {self.boost_expiry.strftime('%H:%M')}")
                 new_state = BatteryState.EV_PROTECT
 
-        elif self.is_pm_export() is True or \
-            (self.inverter.soc > 50 and self.current_state == BatteryState.PEAK_SHAVE):
+        elif self.is_pm_export() is True:
             new_state = BatteryState.PEAK_SHAVE
 
         # Clear expiry if we are no longer in boost and time has passed
@@ -567,7 +576,7 @@ class BatteryManager:
         logging.info(f"Transitioning: {self.current_state.name} -> {target_state.name}")
 
         try:
-        # First, any closing actions in the current state
+            # First, any closing actions in the current state
             if self.current_state == BatteryState.WINTER_BOOST:
                 if await self.shelly.read_switch(stgs.Shelly.sw1_url) == "On":
                     logging.info("Turning off heating.")
@@ -582,14 +591,16 @@ class BatteryManager:
             # elif self.current_state == BatteryState.PEAK_SHAVE:
                 # await self.inverter.set_mode("discharge_now")
 
-        # Then actions for new state
+            # Then actions for new state
             if target_state == BatteryState.WINTER_BOOST:
+                logging.info(f"EV load detected. Boosting {self.boost_expiry.strftime('%H:%M')}")
                 if self.inverter.aux_temp < 15:  # Force heating on
                     logging.info("Turning on heating...")
                     asyncio.create_task(self.shelly.set_switch(stgs.Shelly.sw1_url, True))
                 await self.inverter.set_mode("charge_now")
 
             elif target_state == BatteryState.EV_PROTECT:
+                logging.info(f"EV load detected. Pausing {self.boost_expiry.strftime('%H:%M')}")
                 await self.inverter.set_mode("pause")
 
             elif target_state == BatteryState.ECO_OPTIMISE:

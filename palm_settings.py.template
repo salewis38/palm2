@@ -52,6 +52,9 @@ class GE:
     # pm_export_start enables export of any excess during agile export early-evening peak
     pm_export_start = "17:15"
 
+    # Excess EV consumption over PV generation required to trigger battery pause
+    ev_power_threshold = 1500
+
 class PVOutput:
     """PVOutput.org data logging/analysis service"""
     enable = True

@@ -40,8 +40,10 @@ class GE:
 
     batt_max_charge = batt_capacity * batt_utilisation
 
-    # Inverter charge/discharge rate
-    charge_rate = 3
+    # Inverter max charge/discharge rate
+    # A lower charge rate reduces stress on inverter for overnight charge
+    charge_rate = 2
+    discharge_rate = 3
 
     # Start time for Overnight Charge. If "" disables writing this inverter register
     start_time = "23:30"
@@ -51,9 +53,6 @@ class GE:
 
     # pm_export_start enables export of any excess during agile export early-evening peak
     pm_export_start = "17:15"
-
-    # Excess EV consumption over PV generation required to trigger battery pause
-    ev_power_threshold = 1500
 
 class PVOutput:
     """PVOutput.org data logging/analysis service"""

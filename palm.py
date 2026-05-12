@@ -34,9 +34,13 @@ from givenergy_modbus.client.client import Client
 
 # Changelog:
 # v2.0.0    10/Apr/26 First version to handle continuous Modbus data collection and control.
-# v2.0.1    18/Apr/26 Added state machine for battery control and CLI settings.
+# v2.0.1    10/Apr/26 Added state machine for battery control and CLI settings.
+# v2.0.1a   19/Apr/26 Bugfix on EV charging logic
+# v2.0.1b   21/Apr/26 Added 15s wait to pause/end pause battery controls
+# v2.0.2    12/May/26 Read charge/discharge limits from settings, added get_status option
 
-PALM_VERSION = "v2.0.1"
+
+PALM_VERSION = "v2.0.2"
 # -*- coding: utf-8 -*-
 # pylint: disable=logging-not-lazy
 # pylint: disable=consider-using-f-string
@@ -70,7 +74,7 @@ class GivEnergyLocal:
         self._client = None
         self._lock = asyncio.Lock()
         self._consecutive_fails = 0
-        self.MAX_FAILURES = 3
+        self._max_failures = 3
 
     async def _get_client(self):
         """Returns existing client or initializes a new one."""
@@ -102,7 +106,7 @@ class GivEnergyLocal:
 
     async def get_latest_data(self):
         """Fetch inverter data."""
-        if self._consecutive_fails >= self.MAX_FAILURES:
+        if self._consecutive_fails >= self._max_failures:
             logger.warning("Cooling down due to consecutive failures...")
             await asyncio.sleep(30)
             self._consecutive_fails = 0
@@ -131,7 +135,7 @@ class GivEnergyLocal:
             except (asyncio.TimeoutError, Exception) as e:
                 self._consecutive_fails += 1
                 self.last_update_success = False
-                logger.error(f"Read failure ({self._consecutive_fails}/{self.MAX_FAILURES}): {e}")
+                logger.error(f"Read failure ({self._consecutive_fails}/{self._max_failures}): {e}")
                 await self.close_connection()
 
     def _update_internal_state(self, inv):
@@ -157,11 +161,15 @@ class GivEnergyLocal:
     async def set_mode(self, cmd: str):
         """Executes inverter control commands with persistence and locking."""
 
+        stop_event = asyncio.Event()
+
         start_time = t_to_hrs_raw(t_to_mins(stgs.GE.start_time))  # Start of off-peak 23:30
         end_time = t_to_hrs_raw(t_to_mins(stgs.GE.end_time))  # End of off-peak 05:30
+        charge_rate = int(stgs.GE.charge_rate * 10 - 1)
+        discharge_rate = int(stgs.GE.discharge_rate * 10 - 1)
 
         if stgs.pg.test_mode:
-            logger.info(f"DRY RUN: Setting inverter mode: {cmd}")
+            logger.info(f"TEST ONLY: Setting inverter mode: {cmd}")
             return
         logger.info(f"Setting inverter mode: {cmd}")
 
@@ -203,10 +211,18 @@ class GivEnergyLocal:
 
                 elif cmd == "pause":  # pause register settings: 0 = run, 3 = pause
                     await client.execute(cmds.set_battery_pause_mode(3), 2.0, 2)
+                    try:  # Wait 15 seconds - this command takes time
+                        await asyncio.wait_for(stop_event.wait(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        pass
                     verify_target = ("battery_pause_mode", 3)
 
                 elif cmd == "end_pause":  # pause register settings: 0 = run, 3 = pause
                     await client.execute(cmds.set_battery_pause_mode(0), 2.0, 2)
+                    try:  # Wait 15 seconds - this command takes time
+                        await asyncio.wait_for(stop_event.wait(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        pass
                     verify_target = ("battery_pause_mode", 0)
 
                 elif cmd == "play":
@@ -215,7 +231,8 @@ class GivEnergyLocal:
                     await client.execute(cmds.set_discharge_slot_1_start(1), 2.0, 2)
                     await client.execute(cmds.set_discharge_slot_1_end(2359), 2.0, 2)
                     await client.execute(cmds.set_charge_target(100), 2.0, 2)
-                    await client.execute(cmds.set_battery_discharge_limit(29), 2.0, 2)
+                    await client.execute(cmds.set_battery_discharge_limit(discharge_rate), 2.0, 2)
+                    await client.execute(cmds.set_battery_charge_limit(charge_rate), 2.0, 2)
                     await client.execute(cmds.set_enable_discharge(False), 2.0, 2)
                     await client.execute(cmds.set_enable_charge(True), 2.0, 2)
                     verify_target = ("enable_charge_target", True)
@@ -224,6 +241,11 @@ class GivEnergyLocal:
                     await client.execute(cmds.set_charge_target(self.tgt_soc), 2.0, 2)
                     await client.execute(cmds.enable_charge_target(True), 2.0, 2)
                     verify_target = ("enable_charge_target", True)
+
+                elif cmd == "get_status":
+                    await client.refresh_plant(full_refresh=True)
+                    inverter = client.plant.inverter
+                    print(inverter)
 
                 else:
                     logger.error(f"Unknown command: {cmd}")
@@ -314,7 +336,7 @@ async def pvoutput_put(data_snapshot: dict):
     final_url = f"{base_url}?{query_string}&t={post_time}"
 
     if stgs.pg.test_mode:
-        logger.info(f"DRY RUN URL: {final_url}")
+        logger.info(f"TEST ONLY URL: {final_url}")
         return
 
     await asyncio.sleep(2)  # Rate limit respect
@@ -497,8 +519,8 @@ class BatteryManager:
 
         self.ev_power_threshold: int = stgs.GE.ev_power_threshold
 
-        # Winter Boost Logic
-        self.boost_expiry = None
+        # Battery pause/boost Logic. Minute time if active, otherwise -1
+        self.boost_end_time:int = -1
 
     def is_winter(self):
         """Checks if current date falls within the defined winter months."""
@@ -519,9 +541,8 @@ class BatteryManager:
         """Agile Export trigger (evening). Active in warmer months only if SoC > 50%"""
         if stgs.GE.pm_export_start != "" and not self.is_winter() and \
                 self.inverter.aux_temp > 14 and self.inverter.aux_co2 > 100:
-
             t_now = t_to_mins(time.strftime("%H:%M", time.localtime()))
-            return (self.inverter.soc > 70 and t_now == t_to_mins(stgs.GE.pm_export_start)) or \
+            return (self.inverter.soc > 70 and t_now >= t_to_mins(stgs.GE.pm_export_start)) or \
                 (self.inverter.soc > 50 and self.current_state == BatteryState.PEAK_SHAVE)
         return False
 
@@ -534,26 +555,28 @@ class BatteryManager:
 
     def calculate_aligned_expiry(self, now):
         """ Calculates expiry time that ends on the next :00 or :30 boundary. """
-        minutes_to_next_boundary = 30 - (now.minute % 30)
-        expiry = now + timedelta(minutes=minutes_to_next_boundary)
+        minutes_to_next_boundary = 30 - (now % 30)
+        expiry = now + minutes_to_next_boundary
         # Strip seconds and microseconds for a clean boundary
-        return expiry.replace(second=0, microsecond=0)
+        return expiry
 
     async def update(self):
         """ Determines next state from changes to inputs and triggers inverter commands """
-        t_now = datetime.now()
+        t_now = t_to_mins(time.strftime("%H:%M", time.localtime()))
+        # t_now = t_to_mins(datetime.now())
 
         # Default next state (Priority Logic)
         new_state = BatteryState.ECO_OPTIMISE  # Default baseline
 
-        # If EV is already active extend either boost or pause
-        if self.boost_expiry is True and t_now < self.boost_expiry:
+        # If EV is already active extend and it's not midnight, skip rest of logic
+        if 0 < t_now < self.boost_end_time:
             new_state = self.current_state
 
-        # Check if we should start either a boost or a pause
-        elif self.is_ev_charging() is True and self.is_off_peak() is False and \
-                t_now.minute % 30 < 20:
-            self.boost_expiry = self.calculate_aligned_expiry(t_now)
+        # Check if we should start either a boost or a pause, ignore final 10 mins of each period
+        elif self.is_ev_charging() is True and self.is_off_peak() is False: # and \
+                # t_now % 30 < 20:
+            self.boost_end_time = self.calculate_aligned_expiry(t_now)
+            print(self.boost_end_time)
             if self.is_winter() is True:
                 new_state = BatteryState.WINTER_BOOST
             else:  # Summer/Spring behaviour: just pause discharge
@@ -563,11 +586,11 @@ class BatteryManager:
             new_state = BatteryState.PEAK_SHAVE
 
         # Clear expiry if we are no longer in boost and time has passed
-        if self.boost_expiry is True and t_now >= self.boost_expiry:
+        if t_now >= self.boost_end_time > 0:
+            self.boost_end_time = -1
             logging.info("Boost period completed.")
-            self.boost_expiry = None
 
-        # 2. Handle State Transitions
+        # Handle State Transitions
         if new_state != self.current_state:
             await self.transition_to(new_state)
 
@@ -593,14 +616,14 @@ class BatteryManager:
 
             # Then actions for new state
             if target_state == BatteryState.WINTER_BOOST:
-                logging.info(f"EV load detected. Boosting {self.boost_expiry.strftime('%H:%M')}")
+                logging.info(f"EV load detected. Boosting to {t_to_hrs(self.boost_end_time)}")
                 if self.inverter.aux_temp < 15:  # Force heating on
                     logging.info("Turning on heating...")
                     asyncio.create_task(self.shelly.set_switch(stgs.Shelly.sw1_url, True))
                 await self.inverter.set_mode("charge_now")
 
             elif target_state == BatteryState.EV_PROTECT:
-                logging.info(f"EV load detected. Pausing {self.boost_expiry.strftime('%H:%M')}")
+                logging.info(f"EV load detected. Pausing to {t_to_hrs(self.boost_end_time)}")
                 await self.inverter.set_mode("pause")
 
             elif target_state == BatteryState.ECO_OPTIMISE:
@@ -629,6 +652,10 @@ def t_to_mins(time_str: str) -> int:
     except (ValueError, AttributeError):
         return 0
 
+def t_to_hrs(mins: int) -> str:
+    """Strict HH:MM format integer conversion."""
+    mins = max(0, min(mins, 1439))  # Clamp to 23:59
+    return f"{mins // 60:02d}:{mins % 60:02d}"
 
 def t_to_hrs_raw(mins: int) -> int:
     """Strict HHMM format integer conversion."""
@@ -713,8 +740,8 @@ async def main():
         else:  # Test mode. 15 second loop
             post_time: str = time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime())
             print(f"{post_time} Cycle: {loop_counter}")
-            pprint(inverter.__dict__)
-            print()
+            # pprint(inverter.__dict__)
+            # print()
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=15.0)
             except asyncio.TimeoutError:
@@ -725,6 +752,8 @@ async def main():
             loop_counter = 1
         else:
             loop_counter += 1
+
+        stgs.pg.loop_counter = loop_counter
 
     await inverter.close_connection()
     logger.info("PALM v2 Service Stopped Cleanly")
@@ -774,7 +803,7 @@ if __name__ == '__main__':
     logger.critical("-t | --test  : test mode (4x speed, no external server writes)")
     logger.critical("-d | --debug : debug mode, extra verbose")
     logger.critical("-o | --once  : once mode, reports inverter status and then exit")
-    logger.critical("-x | --execute [charge_now | discharge_now | end_pause | pause | play] : run single command")
+    logger.critical("-x | --execute [charge_now | discharge_now | end_pause | pause | play | get_status] : run single command")
     logger.critical("")
     if MESSAGE != "":
         logger.critical(MESSAGE)
@@ -782,5 +811,5 @@ if __name__ == '__main__':
 
     try:
         asyncio.run(main())
-    except Exception as e:
-        logger.critical(f"Global Crash: {e}")
+    except Exception as exc:
+        logger.critical(f"Global Crash: {exc}")

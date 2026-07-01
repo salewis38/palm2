@@ -38,9 +38,9 @@ from givenergy_modbus.client.client import Client
 # v2.0.1a   19/Apr/26 Bugfix on EV charging logic
 # v2.0.1b   21/Apr/26 Added 15s wait to pause/end pause battery controls
 # v2.0.2    12/May/26 Read charge/discharge limits from settings, added get_status option
+# v2.0.2a   01/Jul/26 Added safe restart to inverter control
 
-
-PALM_VERSION = "v2.0.2"
+PALM_VERSION = "v2.0.2a"
 # -*- coding: utf-8 -*-
 # pylint: disable=logging-not-lazy
 # pylint: disable=consider-using-f-string
@@ -253,7 +253,7 @@ class GivEnergyLocal:
                 if verify_target:
                     attr, expected = verify_target
                     for attempt in range(1, 4):
-                        await asyncio.sleep(2)  # Give the inverter time to process
+                        await asyncio.sleep(15)  # Give the inverter time to process
                         await client.refresh_plant(full_refresh=False)
 
                         # Get actual value from the inverter object
@@ -540,10 +540,10 @@ class BatteryManager:
     def is_pm_export(self):
         """Agile Export trigger (evening). Active in warmer months only if SoC > 50%"""
         if stgs.GE.pm_export_start != "" and not self.is_winter() and \
-                self.inverter.aux_temp > 14 and self.inverter.aux_co2 > 100:
+                self.inverter.aux_temp > 14 and self.inverter.aux_co2 > 120:
             t_now = t_to_mins(time.strftime("%H:%M", time.localtime()))
-            return (self.inverter.soc > 70 and t_now >= t_to_mins(stgs.GE.pm_export_start)) or \
-                (self.inverter.soc > 50 and self.current_state == BatteryState.PEAK_SHAVE)
+            return (self.inverter.soc > 90 and t_now >= t_to_mins(stgs.GE.pm_export_start)) or \
+                (self.inverter.soc > 30 and self.current_state == BatteryState.PEAK_SHAVE)
         return False
 
     def is_ev_charging(self):
@@ -559,6 +559,10 @@ class BatteryManager:
         expiry = now + minutes_to_next_boundary
         # Strip seconds and microseconds for a clean boundary
         return expiry
+
+    async def start(self):
+        """ Ensure inverter is put into a safe state on PALM restart """
+        await self.inverter.set_mode("play")
 
     async def update(self):
         """ Determines next state from changes to inputs and triggers inverter commands """
@@ -683,6 +687,8 @@ async def main():
 
     logger.info("PALM v2 Service Started")
 
+    await manager.start()
+
     loop_counter = 0
     while not stop_event.is_set():
 
@@ -803,7 +809,7 @@ if __name__ == '__main__':
     logger.critical("-t | --test  : test mode (4x speed, no external server writes)")
     logger.critical("-d | --debug : debug mode, extra verbose")
     logger.critical("-o | --once  : once mode, reports inverter status and then exit")
-    logger.critical("-x | --execute [charge_now | discharge_now | end_pause | pause | play | get_status] : run single command")
+    logger.critical("-x | --execute [charge_now | discharge_now | end_pause | pause | play | get_status] : command mode")
     logger.critical("")
     if MESSAGE != "":
         logger.critical(MESSAGE)

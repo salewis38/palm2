@@ -1,0 +1,5 @@
+# Everything CI needs. The Modbus library is deliberately NOT installed:
+# tests replace it with a fake so they never touch hardware.
+httpx>=0.27,<1
+coverage>=7
+ruff>=0.6

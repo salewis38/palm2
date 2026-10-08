@@ -793,8 +793,8 @@ class PVOutputUploader:
         text = (resp.text or "").strip()[:300]
 
         if resp.status_code == 200:
-            logger.info("Data; Write to pvoutput.org; %s; %s", fields.get("d"), fields.get("t"))
-            logger.debug("PVOutput payload: %s", {k: v for k, v in fields.items() if k not in ("d", "t")})
+            logger.info("Data; Write to pvoutput.org; %s; %s; %s", fields.get("d"), fields.get("t"),
+                {k: v for k, v in fields.items() if k not in ("d", "t")})
             THROTTLE.forget("pvoutput_deferred")
             THROTTLE.recovered("pvoutput", "PVOutput uploads restored")
             return "ok"

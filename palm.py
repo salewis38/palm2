@@ -757,13 +757,13 @@ class PVOutputUploader:
             "b4": t.e_battery_charge_total_wh,
             "b5": t.e_battery_discharge_total_wh,
         }
-        # Daily generation total (Wh). Skip if it goes backwards (API/register glitch).
-        if self._last_energy.get("date") == day and t.pv_energy_wh + 1 < self._last_energy.get("wh", 0):
-            logger.warning("PV energy total went backwards (%s < %s); omitting v1",
-                           t.pv_energy_wh, self._last_energy.get("wh"))
-        else:
-            fields["v1"] = t.pv_energy_wh
-            self._last_energy = {"date": day, "wh": t.pv_energy_wh}
+ #       # Daily generation total (Wh). Skip if it goes backwards (API/register glitch).
+ #       if self._last_energy.get("date") == day and t.pv_energy_wh + 1 < self._last_energy.get("wh", 0):
+ #           logger.warning("PV energy total went backwards (%s < %s); omitting v1",
+ #                          t.pv_energy_wh, self._last_energy.get("wh"))
+ #       else:
+ #           fields["v1"] = t.pv_energy_wh
+ #           self._last_energy = {"date": day, "wh": t.pv_energy_wh}
         return {k: v for k, v in fields.items() if v is not None}
 
     # -- upload --------------------------------------------------------------

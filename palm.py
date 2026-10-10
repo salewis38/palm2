@@ -78,7 +78,7 @@ except ImportError:  # pragma: no cover
 
 PALM_VERSION = "v2.0.4"
 # -*- coding: utf-8 -*-
-# pylint: disable=logging-fstring-interpolation
+# pylint: disable=logging-fstring-interpolation, max-line-length = 120, docstring-min-length = 5, max-module-lines = 1500
 
 logger = logging.getLogger("PALM")
 

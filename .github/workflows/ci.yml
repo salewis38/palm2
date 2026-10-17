@@ -73,7 +73,7 @@ jobs:
 
       - name: Upload annotated coverage report
         if: matrix.os == 'ubuntu-24.04' && (matrix.python-version == '3.12' || matrix.python-version == '3.13')
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report-${{ matrix.python-version }}
           path: coverage-report-${{ matrix.python-version }}
@@ -84,7 +84,7 @@ jobs:
 
       - name: Upload coverage report
         if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.12'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-xml
           path: coverage.xml

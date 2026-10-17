@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse a committed settings file (it holds API keys)
+        run: |
+          if git ls-files --error-unmatch palm_settings.py >/dev/null 2>&1; then
+            echo "::error::palm_settings.py is tracked by git. Remove it (git rm --cached) and rotate any keys it contained."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Byte-compile
+        run: python -m compileall -q palm.py tests tools
+
+      - name: Lint (non-blocking until the first clean run)
+        continue-on-error: true
+        run: ruff check .
+
+      - name: Unit tests with coverage
+        run: |
+          python -W error::RuntimeWarning -m coverage run --source=. --omit="tests/*,palm_settings*.py" \
+            -m unittest discover -s tests -v
+          python -m coverage report -m
+
+      - name: SD-card wear table (informational; thresholds are enforced by the tests)
+        if: matrix.python-version == '3.12'
+        run: python tools/measure_wear.py
+
+      - name: Annotated coverage report (stdlib tool, Python 3.12+)
+        if: matrix.python-version == '3.12' || matrix.python-version == '3.13'
+        run: python tools/stdlib_coverage.py --out coverage-report-${{ matrix.python-version }}
+
+      - name: Upload annotated coverage report
+        if: matrix.python-version == '3.12' || matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ matrix.python-version }}
+          path: coverage-report-${{ matrix.python-version }}
+
+      - name: Coverage XML
+        if: matrix.python-version == '3.12'
+        run: python -m coverage xml
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml

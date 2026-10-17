@@ -1,0 +1,5 @@
+# Runtime dependencies for running PALM on the host (e.g. a Raspberry Pi).
+httpx>=0.27,<1
+# Provides givenergy_modbus.client.client.Client (async Modbus client).
+# Confirm the exact package name/version you run in production and pin it here.
+givenergy-modbus-async

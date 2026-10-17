@@ -10,7 +10,8 @@ PVOutput.org uploads. See the changelog in `palm.py`.
 | `palm.py` | The application |
 | `palm_settings.example.py` | Copy to `palm_settings.py` (git-ignored) and edit |
 | `tests/` | Unit tests (standard library `unittest`; no hardware or network needed) |
-| `.github/workflows/ci.yml` | GitHub Actions: Python 3.10-3.13, tests + coverage |
+| `.github/workflows/ci.yml` | GitHub Actions: Python 3.10-3.13 on Ubuntu 24.04 (blocking) plus an informational Ubuntu 26.04 job |
+| `.github/dependabot.yml` | Monthly pull requests to keep the actions used by CI on supported versions |
 | `deploy/palm.service` | systemd unit (notify, watchdog, restart policy, SD-friendly writable paths) |
 | `tools/measure_wear.py` | Prints what PALM writes to disk and logs in a simulated day |
 | `tools/stdlib_coverage.py` | Dependency-free coverage report (Python 3.12+) |
@@ -126,6 +127,16 @@ git commit -m "Add test suite and CI"
 git push -u origin tests-and-ci
 # open a pull request; the CI workflow runs on it
 ```
+
+### CI runners and action versions
+
+* **Runner images are pinned** (`ubuntu-24.04`), not `ubuntu-latest`, which GitHub is moving to Ubuntu 26.04 between
+  19 October and 19 November 2026. A separate **Ubuntu 26.04 job** runs on Python 3.12 and never fails the run; once
+  it has been green for a while, add `ubuntu-26.04` to the `os` list in `ci.yml` and delete the `include` entry.
+* **Actions use their Node 24 releases** (`checkout@v6`, `setup-python@v6`, `upload-artifact@v6`). GitHub is removing the
+  Node 20 runtime, and older majors print "Node.js 20 is deprecated". Dependabot opens a monthly pull request when newer
+  versions appear, and `tests/test_workflow.py` fails if a runner label floats or an action drops back to a Node 20 major.
+* Reports and artifacts come from the 24.04 baseline only, so two matrix jobs never upload an artifact with the same name.
 
 CI refuses to pass if `palm_settings.py` is tracked. If it was ever committed, its keys remain in
 git history: rotate the PVOutput and OpenWeatherMap keys.

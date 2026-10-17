@@ -1,0 +1,10 @@
+# Keeps the actions used by the workflow on supported runtimes (for example the Node 20 -> Node 24 move),
+# by opening a pull request when a newer major version is released. Delete this file to opt out.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"

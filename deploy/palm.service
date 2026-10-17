@@ -1,0 +1,46 @@
+[Unit]
+Description=PALM - PV Active Load Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# Adjust user and paths for your install
+User=palm
+WorkingDirectory=/opt/palm
+ExecStart=/opt/palm/.venv/bin/python /opt/palm/palm.py
+
+# --- Restart policy ---------------------------------------------------------
+Restart=on-failure
+RestartSec=30
+# Exit 2 = invalid settings, 3 = another instance already running. Restarting cannot fix either, and a
+# restart loop floods the journal (and the SD card behind it): ~5,760 restarts a day at 15 s.
+# (No StartLimit gate on purpose: after a genuine crash a stopped controller can leave the battery
+# paused or force-charging, which is worse than log noise.)
+RestartPreventExitStatus=2 3
+# Loop liveness: a command plus verification can block the loop for about a minute
+WatchdogSec=300
+# Give shutdown time to restore the inverter to its safe state (needs more than SHUTDOWN_TIMEOUT_S)
+TimeoutStopSec=150
+
+# --- SD-card friendly: the only writable places are the two directories below ---
+# StateDirectory   -> /var/lib/palm  (persistent; PVOutput retry spool)   exported as $STATE_DIRECTORY
+# RuntimeDirectory -> /run/palm      (tmpfs; lock file)                   exported as $RUNTIME_DIRECTORY
+# To keep the PVOutput spool in RAM too (zero wear; lost on reboot), set in palm_settings.py:
+#     PVOutput.spool_file = "/run/palm/pvoutput_spool.jsonl"
+StateDirectory=palm
+RuntimeDirectory=palm
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# No .pyc writes into the (read-only) install directory
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Cap what a misbehaving run can push into the journal
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
+Environment=PVOUTPUT_API_KEY=
+Environment=PVOUTPUT_SYSTEM_ID=
+
+[Install]
+WantedBy=multi-user.target

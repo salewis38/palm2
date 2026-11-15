@@ -45,6 +45,16 @@ class PVOutput:
     # spool_file = "/run/palm/pvoutput_spool.jsonl"
 
 
+class Web:  # optional read-only status page, JSON and Prometheus metrics. Nothing is written to disk.
+    enable = False
+    host = "127.0.0.1"                    # this machine only. "0.0.0.0" = reachable from your LAN: set a token and a firewall rule
+    port = 8080                           # 1024 or above, so no root is needed
+    token = ""                            # optional shared secret: "Authorization: Bearer <token>" or "?token=<token>"
+    history_hours = 24                    # rolling history for the charts, kept in RAM only (0 = no history)
+    # allowed_hosts = ["pi.example.com"]  # extra Host names accepted (IP addresses, localhost, single-label names
+    #                                     # such as "raspberrypi" and *.local are always accepted)
+
+
 class Shelly:
     em0_url = "http://192.168.1.60/status"    # EV power meter (None to disable)
     sw1_url = "http://192.168.1.61"           # heater switch (None to disable)

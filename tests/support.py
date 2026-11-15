@@ -8,6 +8,7 @@ Importing this module (before the PALM module) installs:
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import pathlib
 import sys
@@ -37,6 +38,7 @@ def make_settings() -> types.ModuleType:
     mod.PVOutput = SimpleNamespace(enable=False, url="https://pvoutput.example/service/r2",
                                    key="TESTKEY", sid="12345")
     mod.Shelly = SimpleNamespace(em0_url="http://shelly-em.test/status", sw1_url="http://shelly-sw.test")
+    mod.Web = SimpleNamespace(enable=False, host="127.0.0.1", port=0, token="", history_hours=24, allowed_hosts=[])
     mod.CarbonIntensity = SimpleNamespace(enable=False, url="https://carbon.test/regional/postcode",
                                           PostCode="AB1")
     mod.OpenWeatherMap = SimpleNamespace(enable=False, url="https://weather.test/data/3.0",
@@ -88,6 +90,7 @@ def _install_stubs() -> None:
 
 
 _install_stubs()
+logging.getLogger("asyncio").setLevel(logging.ERROR)     # no slow-callback noise from heavy tests
 palm = importlib.import_module(MODULE_NAME)
 import httpx  # noqa: E402  (real or stub, whichever _install_stubs left in place)
 

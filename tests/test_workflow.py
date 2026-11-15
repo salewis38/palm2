@@ -58,6 +58,11 @@ class Workflow(unittest.TestCase):
         for step in uploads:
             self.assertIn("matrix.os", step, "upload step must be limited to one runner image (or name must include it)")
 
+    def test_every_python_file_is_byte_compiled(self):
+        compile_line = next(line for line in self.text.splitlines() if "compileall" in line)
+        for name in ("palm.py", "palm_gui.py", "tests", "tools"):
+            self.assertIn(name, compile_line)
+
     def test_ci_runs_the_whole_suite_and_guards_secrets(self):
         self.assertIn("unittest discover -s tests", self.text)
         self.assertIn("git ls-files --error-unmatch palm_settings.py", self.text)

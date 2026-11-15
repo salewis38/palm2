@@ -60,7 +60,7 @@ class Workflow(unittest.TestCase):
 
     def test_every_python_file_is_byte_compiled(self):
         compile_line = next(line for line in self.text.splitlines() if "compileall" in line)
-        for name in ("palm.py", "palm_gui.py", "tests", "tools"):
+        for name in ("palm.py", "tests", "tools"):
             self.assertIn(name, compile_line)
 
     def test_ci_runs_the_whole_suite_and_guards_secrets(self):

@@ -37,6 +37,30 @@ class DeadCode(unittest.TestCase):
             self.assertGreater(reads, 0, f"self.{name} is assigned but never read")
 
 
+class PageModule(unittest.TestCase):
+    def test_palm_gui_holds_data_only(self):
+        """palm_gui.py is one string and a docstring: no code to run, nothing to review for behaviour."""
+        import ast
+        tree = ast.parse((ROOT / "palm_gui.py").read_text(encoding="utf-8"))
+        body = tree.body
+        self.assertTrue(isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant), "docstring first")
+        rest = body[1:]
+        self.assertEqual(len(rest), 1)
+        self.assertIsInstance(rest[0], ast.Assign)
+        self.assertEqual([t.id for t in rest[0].targets], ["PAGE"])
+        self.assertIsInstance(rest[0].value, ast.Constant)
+
+    def test_palm_py_no_longer_embeds_the_page(self):
+        self.assertNotIn("<!doctype html>\n<html", SOURCE.replace(palm.FALLBACK_PAGE, ""))
+        self.assertNotIn("WEB_PAGE", SOURCE)
+        self.assertNotIn("<script>", SOURCE)
+
+    def test_palm_py_does_not_import_the_page_at_start_up(self):
+        """The controller must run without palm_gui.py: it is loaded lazily, only when the server starts."""
+        top_level = [line for line in SOURCE.splitlines() if line.startswith(("import palm_gui", "from palm_gui"))]
+        self.assertEqual(top_level, [])
+
+
 class ExampleSettings(unittest.TestCase):
     def load(self):
         spec = importlib.util.spec_from_file_location("palm_settings_example", ROOT / "palm_settings.example.py")

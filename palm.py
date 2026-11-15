@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
+import importlib
+import ipaddress
 import json
 import logging
 import math
@@ -25,7 +28,7 @@ from enum import Enum, auto
 from pathlib import Path
 from pprint import pprint
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 import palm_settings as stgs
@@ -85,8 +88,14 @@ except ImportError:  # pragma: no cover
 #             verified and retried with backoff like any command. Disable: GE.refresh_at_offpeak_start = False
 # v2.0.7    - Evening export (PEAK_SHAVE) ends when the overnight window opens and cannot start inside it
 #           - The overnight re-assert is always on: GE.refresh_at_offpeak_start has been removed
+# v2.1.0    - Optional read-only status web server (Web section of palm_settings): live page, /status.json,
+#             /history.json (24 h kept in memory only) and /metrics (Prometheus). Standard library only,
+#             GET/HEAD only, loopback by default, optional token, Host-header check, no disk writes
+# v2.1.1    - The status page moved out of palm.py into palm_gui.py, which sits next to it. It is optional:
+#             without it a minimal page is served and /status.json and /metrics are unaffected
+#           - Host system stats on the page, /status.json and /metrics: uptime and load averages
 
-PALM_VERSION = "v2.0.7"
+PALM_VERSION = "v2.1.1"
 # -*- coding: utf-8 -*-
 # pylint: disable=logging-fstring-interpolation, consider-using-with
 
@@ -323,6 +332,11 @@ class LogThrottle:
     def forget(self, key: str) -> None:
         self._state.pop(key, None)
 
+    def failing(self) -> dict[str, dict[str, int]]:
+        """Conditions failing right now: key -> seconds since the first failure and number of occurrences."""
+        now = self._clock()
+        return {key: {"since_s": round(now - st["first"]), "count": st["total"]} for key, st in self._state.items()}
+
 
 THROTTLE = LogThrottle()
 
@@ -368,6 +382,7 @@ def validate_settings() -> list[str]:
         for name in ("batt_capacity", "batt_utilisation"):
             if num(getattr(stgs.GE, name, None)) is None:
                 errors.append(f"GE.{name} must be a number")
+    errors.extend(_web_errors())
     return errors
 
 
@@ -684,6 +699,8 @@ class PVOutputUploader:
         self.http = http
         self._lock = asyncio.Lock()
         self._blocked_until = 0.0                       # epoch seconds
+        self.last_ok: Optional[datetime] = None         # time of the last accepted write
+        self.writes_ok = 0                              # accepted writes since start
         spool = getattr(stgs.PVOutput, "spool_file", None) or STATE_DIR / "pvoutput_spool.jsonl"
         self.spool_path = Path(spool)
         self._dirty = False                 # file may differ from memory -> rewrite it on the next change
@@ -824,6 +841,8 @@ class PVOutputUploader:
             # Data; Write to pvoutput.org; 20261008; 19:19; {'v2': 0, 'v4': 553, ...}
             logger.info("Data; Write to pvoutput.org; %s; %s; %s", fields.get("d"), fields.get("t"),
                         {k: v for k, v in fields.items() if k not in ("d", "t")})
+            self.last_ok = datetime.now()
+            self.writes_ok += 1
             THROTTLE.forget("pvoutput_deferred")
             THROTTLE.recovered("pvoutput", "PVOutput uploads restored")
             return "ok"
@@ -840,6 +859,17 @@ class PVOutputUploader:
             return "drop"
         THROTTLE.failure("pvoutput", logging.WARNING, "PVOutput server error (HTTP %d): %s", resp.status_code, text)
         return "retry"
+
+    def status(self) -> dict[str, Any]:
+        """Upload state as plain data for the status page. Contains no credentials."""
+        return {
+            "enabled": bool(getattr(stgs.PVOutput, "enable", False)),
+            "queued": len(self._queue),
+            "writes_ok": self.writes_ok,
+            "last_ok": self.last_ok.isoformat(timespec="seconds") if self.last_ok else None,
+            "last_ok_epoch": round(self.last_ok.timestamp()) if self.last_ok else None,
+            "blocked_for_s": max(0, round(self._blocked_until - time.time())),
+        }
 
     async def upload(self, fields: dict) -> None:
         """Send one status entry, replaying any backlog first and in order; failures are queued and spooled."""
@@ -1214,7 +1244,431 @@ class BatteryManager:
                 self.heater_state = False
         if self.applied_state != BatteryState.ECO_OPTIMISE or self.paused is not False:
             await self.apply(BatteryState.ECO_OPTIMISE, interruptible=False)
+    def status(self, now: datetime) -> dict[str, Any]:
+        """Control state as plain data for the status page."""
+        return {
+            "desired": self.desired_state.name,
+            "applied": self.applied_state.name if self.applied_state else None,
+            "paused": self.paused,
+            "boost_until": self.boost_until.isoformat(timespec="seconds") if self.boost_until else None,
+            "heater_wanted": self.heater_wanted,
+            "heater_on": self.heater_state,
+            "ev_charging": self.is_ev_charging(),
+            "off_peak": self.is_off_peak(now),
+            "offpeak_window": f"{stgs.GE.start_time}-{stgs.GE.end_time}",
+            "reasserted_window": self._refreshed_window.isoformat() if self._refreshed_window else None,
+            "reassert_pending": self._refresh_pending is not None,
+        }
 #  End of BatteryManager
+
+
+# --------------------------------------------------------------------------- #
+# Status web server (read-only; serves in-memory data only, writes nothing to disk)
+# --------------------------------------------------------------------------- #
+WEB_MAX_CONNECTIONS = 8           # simultaneous connections; further ones are answered 503
+WEB_REQUEST_TIMEOUT_S = 5.0       # a request must arrive and be answered within this time (slow-client defence)
+WEB_MAX_LINE = 4096               # longest request or header line accepted
+WEB_MAX_HEADERS = 32
+WEB_MAX_HEADER_BYTES = 8192
+WEB_HISTORY_FIELDS = ("pv", "load", "grid", "battery", "soc", "ev")
+WEB_LOCAL_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain")
+HTTP_REASONS = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+                405: "Method Not Allowed", 414: "URI Too Long", 431: "Request Header Fields Too Large",
+                500: "Internal Server Error", 503: "Service Unavailable"}
+
+
+def web_settings() -> dict[str, Any]:
+    """Read the optional Web section of palm_settings, with safe defaults (disabled, loopback only)."""
+    cfg = getattr(stgs, "Web", None)
+    return {
+        "enable": bool(getattr(cfg, "enable", False)),
+        "host": str(getattr(cfg, "host", "") or "127.0.0.1"),
+        "port": int(getattr(cfg, "port", 8080)),
+        "token": str(getattr(cfg, "token", "") or ""),
+        "history_hours": float(getattr(cfg, "history_hours", 24)),
+        "allowed_hosts": [str(h).strip().lower() for h in (getattr(cfg, "allowed_hosts", None) or [])],
+    }
+
+
+def _web_errors() -> list[str]:
+    """Problems with the optional Web settings (nothing is checked while the server is disabled)."""
+    cfg = getattr(stgs, "Web", None)
+    if not getattr(cfg, "enable", False):
+        return []
+    errors: list[str] = []
+    host = getattr(cfg, "host", "127.0.0.1")
+    if not isinstance(host, str) or not host.strip():
+        errors.append("Web.host must be an address such as '127.0.0.1' or '0.0.0.0'")
+    port = getattr(cfg, "port", 8080)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        errors.append("Web.port must be an integer between 1 and 65535")
+    token = getattr(cfg, "token", "")
+    if token is not None and not isinstance(token, str):
+        errors.append("Web.token must be a string")
+    hours = num(getattr(cfg, "history_hours", 24))
+    if hours is None or not 0 <= hours <= 72:
+        errors.append("Web.history_hours must be between 0 and 72")
+    allowed = getattr(cfg, "allowed_hosts", None) or []
+    if not isinstance(allowed, (list, tuple)) or not all(isinstance(h, str) and h.strip() for h in allowed):
+        errors.append("Web.allowed_hosts must be a list of host names")
+    return errors
+
+
+def system_stats(uptime_file: str = "/proc/uptime") -> dict[str, Any]:
+    """Host uptime and load averages for the status page. Anything unavailable (e.g. off Linux) is None."""
+    uptime = None
+    try:
+        with open(uptime_file, encoding="utf-8") as fh:
+            uptime = round(float(fh.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        load: tuple = tuple(round(value, 2) for value in os.getloadavg())
+    except (OSError, AttributeError):
+        load = (None, None, None)
+    return {"uptime_s": uptime, "load1": load[0], "load5": load[1], "load15": load[2], "cpus": os.cpu_count()}
+
+
+def is_loopback(host: str) -> bool:
+    """True for localhost and loopback addresses (the server is then reachable from this machine only)."""
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip()).is_loopback
+    except ValueError:
+        return False
+
+
+def host_allowed(host_header: str, extra: list[str]) -> bool:
+    """DNS-rebinding defence: accept only IP literals, local-only names and explicitly allowed names.
+
+    A page on a public web site cannot make a browser send a Host header like `192.168.1.5`, `raspberrypi`
+    or `pi.local`, but it can make it send the public name it controls; that is what this rejects."""
+    host = host_header.strip().lower()
+    if not host:
+        return True                                      # HTTP/1.0 clients may omit the header
+    if host.startswith("["):                             # [::1]:8080
+        name = host[1:].split("]", 1)[0]
+    else:
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return "." not in name or name.endswith(WEB_LOCAL_SUFFIXES) or name in extra
+
+
+class History:
+    """Rolling in-memory record of recent readings for the status page's charts. Never written to disk."""
+
+    def __init__(self, minutes: float):
+        self._rows: deque = deque(maxlen=max(1, round(minutes)))
+        self._last_ts: Optional[float] = None
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def add(self, telemetry: Optional[Telemetry], ev_power: Optional[float], now: Optional[float] = None) -> bool:
+        """Record one reading (once per distinct reading). Returns True if a row was added."""
+        if telemetry is None or telemetry.ts == self._last_ts:
+            return False
+        self._last_ts = telemetry.ts
+        self._rows.append((int(now if now is not None else time.time()), telemetry.pv_power, telemetry.consumption,
+                           telemetry.grid_power, telemetry.batt_power, telemetry.soc,
+                           int(ev_power) if ev_power is not None else None))
+        return True
+
+    def columns(self) -> dict[str, Any]:
+        """The history as parallel lists (compact JSON): t, then one list per field in WEB_HISTORY_FIELDS."""
+        rows = list(self._rows)
+        cols: dict[str, Any] = {"interval_s": 60, "t": [r[0] for r in rows]}
+        for index, name in enumerate(WEB_HISTORY_FIELDS, start=1):
+            cols[name] = [r[index] for r in rows]
+        return cols
+
+
+def _label(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def render_metrics(snap: dict[str, Any]) -> str:
+    """Prometheus text exposition of a status snapshot. Values that are unknown are simply omitted."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def gauge(name: str, help_text: str, value: Any, labels: str = "") -> None:
+        if value is None:
+            return
+        if name not in seen:
+            seen.add(name)
+            out.append(f"# HELP {name} {help_text}")
+            out.append(f"# TYPE {name} gauge")
+        out.append(f"{name}{labels} {int(value) if isinstance(value, bool) else value}")
+
+    service = snap.get("service") or {}
+    inv = snap.get("inverter") or {}
+    env = snap.get("environment") or {}
+    control = snap.get("control") or {}
+    pvo = snap.get("pvoutput") or {}
+    health = snap.get("health") or {}
+    system = snap.get("system") or {}
+    gauge("palm_info", "PALM version", 1, '{version="%s"}' % _label(service.get("version", "")))
+    rows = [
+        ("palm_uptime_seconds", "Seconds since PALM started", service.get("uptime_s")),
+        ("palm_system_uptime_seconds", "Seconds since the host booted", system.get("uptime_s")),
+        ("palm_system_load1", "Host load average over 1 minute", system.get("load1")),
+        ("palm_system_load5", "Host load average over 5 minutes", system.get("load5")),
+        ("palm_system_load15", "Host load average over 15 minutes", system.get("load15")),
+        ("palm_system_cpus", "Number of CPUs on the host", system.get("cpus")),
+        ("palm_inverter_data_fresh", "1 if the latest inverter reading is recent enough to act on", inv.get("fresh")),
+        ("palm_inverter_data_age_seconds", "Age of the latest inverter reading", inv.get("age_s")),
+        ("palm_battery_soc_percent", "Battery state of charge", inv.get("soc_percent")),
+        ("palm_pv_power_watts", "Solar generation", inv.get("pv_w")),
+        ("palm_load_power_watts", "House consumption", inv.get("load_w")),
+        ("palm_grid_power_watts", "Grid power (positive = import, as PALM reads it)", inv.get("grid_w")),
+        ("palm_battery_power_watts", "Battery power (positive = discharging)", inv.get("battery_w")),
+        ("palm_grid_voltage_volts", "Grid voltage", inv.get("voltage_v")),
+        ("palm_grid_frequency_hertz", "Grid frequency", inv.get("frequency_hz")),
+        ("palm_pv_energy_today_watt_hours", "Solar energy generated today", inv.get("pv_energy_today_wh")),
+        ("palm_battery_charged_watt_hours", "Lifetime energy into the battery", inv.get("battery_charge_total_wh")),
+        ("palm_battery_discharged_watt_hours", "Lifetime energy out of the battery",
+         inv.get("battery_discharge_total_wh")),
+        ("palm_ev_power_watts", "EV charger power", (snap.get("ev") or {}).get("power_w")),
+        ("palm_co2_intensity_grams_per_kwh", "Grid carbon intensity forecast", env.get("co2_g_per_kwh")),
+        ("palm_temperature_celsius", "Outside temperature", env.get("temp_c")),
+        ("palm_battery_paused", "1 if the battery is paused", control.get("paused")),
+        ("palm_heater_on", "1 if PALM has switched the heater on", control.get("heater_on")),
+        ("palm_off_peak", "1 inside the overnight off-peak window", control.get("off_peak")),
+        ("palm_pvoutput_queued_entries", "Status entries waiting to be sent to PVOutput", pvo.get("queued")),
+        ("palm_pvoutput_writes_ok", "Successful PVOutput writes since start", pvo.get("writes_ok")),
+        ("palm_pvoutput_last_success_timestamp_seconds", "Time of the last successful PVOutput write",
+         pvo.get("last_ok_epoch")),
+        ("palm_failing_conditions", "Number of conditions currently failing", len(health.get("failing") or {})),
+    ]
+    for name, help_text, value in rows:
+        gauge(name, help_text, value)
+    for kind in ("desired", "applied"):
+        current = control.get(kind)
+        for state in STATE_COMMANDS:
+            gauge("palm_battery_state", "Battery state machine: 1 for the current state", int(current == state.name),
+                  '{kind="%s",state="%s"}' % (kind, state.name))
+    return "\n".join(out) + "\n"
+
+
+FALLBACK_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>PALM</title></head>
+<body style="font:15px system-ui,sans-serif;margin:2em;line-height:1.5">
+<h1>PALM</h1>
+<p>The full status page (<code>palm_gui.py</code>) is not installed next to <code>palm.py</code>, so this minimal page
+is shown. The data is available as <b>/status.json</b>, <b>/history.json</b> and <b>/metrics</b> (add your
+<code>?token=</code> to the address if a token is set).</p>
+</body></html>
+"""
+
+
+def load_page() -> str:
+    """The status page from palm_gui.py (next to palm.py), or a minimal built-in page if that file is missing."""
+    try:
+        return importlib.import_module("palm_gui").PAGE
+    except (ImportError, AttributeError):
+        logger.warning("palm_gui.py not found next to palm.py (or it has no PAGE): serving a minimal status page; "
+                       "/status.json and /metrics are unaffected")
+        return FALLBACK_PAGE
+
+
+class _BadRequest(Exception):
+    """A request that is refused before routing (malformed, too large...)."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status, self.message = status, message
+
+
+class StatusServer:
+    """Tiny read-only HTTP server for the status page, JSON and Prometheus metrics.
+
+    Standard library only. GET and HEAD only, one request per connection, no files are served and nothing
+    is written to disk. Limits: connection cap, per-request time limit, request/header size limits, Host
+    header check (DNS rebinding) and an optional shared token."""
+
+    def __init__(self, snapshot, history, host: str, port: int, token: str = "",
+                 allowed_hosts: Optional[list[str]] = None, page: Optional[str] = None):
+        self.snapshot, self.history = snapshot, history
+        self.page = page if page is not None else load_page()
+        self.host, self.port, self.token = host, port, token
+        self.allowed_hosts = list(allowed_hosts or [])
+        self._server: Optional[asyncio.AbstractServer] = None
+        self._writers: set = set()
+        self._active = 0
+        self.routes = {"/": self._page, "/status.json": self._status_json,
+                       "/history.json": self._history_json, "/metrics": self._metrics}
+
+    # -- lifecycle -----------------------------------------------------------
+    async def start(self) -> None:
+        """Start listening. Raises OSError if the address cannot be bound."""
+        self._server = await asyncio.start_server(self._handle, self.host, self.port, limit=WEB_MAX_LINE)
+        self.port = self._server.sockets[0].getsockname()[1]      # resolves port 0 to the real port
+
+    async def stop(self) -> None:
+        """Stop accepting, drop open connections and wait (briefly) for the listener to close."""
+        if self._server is None:
+            return
+        self._server.close()
+        for writer in list(self._writers):
+            writer.close()
+        try:
+            await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+        except (asyncio.TimeoutError, OSError):
+            pass
+        self._server = None
+
+    # -- routes (each returns body bytes and a content type) -------------------
+    def _page(self) -> tuple[bytes, str]:
+        return self.page.encode("utf-8"), "text/html; charset=utf-8"
+
+    def _status_json(self) -> tuple[bytes, str]:
+        return json.dumps(self.snapshot(), separators=(",", ":")).encode("utf-8"), "application/json"
+
+    def _history_json(self) -> tuple[bytes, str]:
+        return json.dumps(self.history(), separators=(",", ":")).encode("utf-8"), "application/json"
+
+    def _metrics(self) -> tuple[bytes, str]:
+        return render_metrics(self.snapshot()).encode("utf-8"), "text/plain; version=0.0.4; charset=utf-8"
+
+    # -- request handling ----------------------------------------------------
+    def _authorised(self, headers: dict[str, str], query: dict[str, list[str]]) -> bool:
+        if not self.token:
+            return True
+        supplied = ""
+        auth = headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+        elif "token" in query:
+            supplied = query["token"][0]
+        return hmac.compare_digest(supplied.encode("utf-8"), self.token.encode("utf-8"))
+
+    @staticmethod
+    async def _read_request(reader: asyncio.StreamReader) -> Optional[tuple[str, str, dict[str, str]]]:
+        """Read the request line and headers. Returns None if the client closed without sending anything."""
+        try:
+            line = await reader.readline()
+        except ValueError:                                  # longer than the stream limit
+            raise _BadRequest(414, "request line too long") from None
+        if not line:
+            return None
+        parts = line.decode("latin-1").split()
+        if len(parts) != 3 or not parts[2].startswith("HTTP/"):
+            raise _BadRequest(400, "bad request")
+        headers: dict[str, str] = {}
+        total = len(line)
+        for _ in range(WEB_MAX_HEADERS + 1):
+            try:
+                raw = await reader.readline()
+            except ValueError:
+                raise _BadRequest(431, "header line too long") from None
+            total += len(raw)
+            if raw in (b"\r\n", b"\n", b""):
+                return parts[0].upper(), parts[1], headers
+            if total > WEB_MAX_HEADER_BYTES:
+                raise _BadRequest(431, "headers too large")
+            name, sep, value = raw.decode("latin-1").partition(":")
+            if sep:
+                headers[name.strip().lower()] = value.strip()
+        raise _BadRequest(431, "too many headers")
+
+    @staticmethod
+    async def _send(writer: asyncio.StreamWriter, status: int, body: bytes = b"",
+                    ctype: str = "text/plain; charset=utf-8", head: bool = False,
+                    extra: tuple[str, ...] = ()) -> None:
+        lines = [f"HTTP/1.1 {status} {HTTP_REASONS.get(status, 'Error')}",
+                 f"Content-Type: {ctype}", f"Content-Length: {len(body)}",
+                 "Cache-Control: no-store", "X-Content-Type-Options: nosniff", "X-Frame-Options: DENY",
+                 "Referrer-Policy: no-referrer",
+                 "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
+                 "script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+                 "frame-ancestors 'none'",
+                 "Connection: close", *extra]
+        writer.write("\r\n".join(lines).encode("latin-1") + b"\r\n\r\n" + (b"" if head else body))
+        await writer.drain()
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            request = await self._read_request(reader)
+        except _BadRequest as exc:
+            await self._send(writer, exc.status, (exc.message + "\n").encode())
+            return
+        if request is None:
+            return
+        method, target, headers = request
+        if method not in ("GET", "HEAD"):
+            await self._send(writer, 405, b"method not allowed\n", extra=("Allow: GET, HEAD",))
+            return
+        head = method == "HEAD"
+        if not host_allowed(headers.get("host", ""), self.allowed_hosts):
+            await self._send(writer, 403, b"host not allowed\n", head=head)
+            return
+        split = urlsplit(target)
+        if split.path == "/healthz":                        # open on purpose: carries no information
+            await self._send(writer, 200, b"ok\n", head=head)
+            return
+        if not self._authorised(headers, parse_qs(split.query)):
+            await self._send(writer, 401, b"token required\n", head=head,
+                             extra=('WWW-Authenticate: Bearer realm="palm"',))
+            return
+        route = self.routes.get(split.path)
+        if route is None:
+            await self._send(writer, 404, b"not found\n", head=head)
+            return
+        try:
+            body, ctype = route()
+        except Exception:  # pylint: disable=broad-except
+            THROTTLE.failure("web", logging.ERROR, "Status server could not build %s", split.path, exc_info=True)
+            await self._send(writer, 500, b"internal error\n", head=head)
+            return
+        await self._send(writer, 200, body, ctype, head=head)
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self._active >= WEB_MAX_CONNECTIONS:
+            try:
+                await self._send(writer, 503, b"busy\n")
+            except (ConnectionError, OSError):
+                pass
+            await self._finish(reader, writer)
+            return
+        self._active += 1
+        self._writers.add(writer)
+        try:
+            await asyncio.wait_for(self._serve(reader, writer), timeout=WEB_REQUEST_TIMEOUT_S)
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            logger.debug("Status server: connection dropped", exc_info=True)
+        except Exception:  # pylint: disable=broad-except
+            THROTTLE.failure("web", logging.WARNING, "Status server error", exc_info=True)
+        finally:
+            self._active -= 1
+            self._writers.discard(writer)
+            await self._finish(reader, writer)
+
+    @staticmethod
+    async def _finish(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Close politely: send FIN, then swallow a little unread input.
+
+        Closing a socket that still holds unread data makes TCP send a reset, which can destroy the response
+        before the client has read it (an early 405/414/431/503 for a request whose body we never read)."""
+        try:
+            if writer.can_write_eof():
+                writer.write_eof()
+            await asyncio.wait_for(reader.read(WEB_MAX_LINE), timeout=0.25)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+        except Exception:  # pylint: disable=broad-except
+            pass
+#  End of StatusServer
 
 
 # --------------------------------------------------------------------------- #
@@ -1237,6 +1691,87 @@ class Service:
         self._next_env_update = 0.0
         self._next_clock_check = 0.0
         self._last_upload_slot: Optional[tuple] = None
+        self._started = time.monotonic()
+        self._started_wall = datetime.now()
+        self.history: Optional[History] = None             # rolling readings for the status page (RAM only)
+        self.web: Optional[StatusServer] = None
+
+    # -- status web server -----------------------------------------------------
+    def snapshot(self) -> dict[str, Any]:
+        """Everything PALM knows, as plain JSON-safe data built from in-memory state. Contains no secrets."""
+        now = datetime.now()
+        reading = self.inverter.latest
+        inverter = None
+        if reading is not None:
+            offset = None
+            if reading.inverter_mins is not None:
+                offset = (reading.inverter_mins - minutes_of(now) + 720) % 1440 - 720
+            inverter = {
+                "fresh": self.inverter.fresh() is not None,
+                "age_s": round(reading.age()),
+                "reading_time": reading.wall.isoformat(timespec="seconds"),
+                "soc_percent": reading.soc,
+                "pv_w": reading.pv_power,
+                "load_w": reading.consumption,
+                "grid_w": reading.grid_power,
+                "battery_w": reading.batt_power,
+                "voltage_v": round(reading.line_voltage, 1),
+                "frequency_hz": round(reading.line_frequency, 2),
+                "grid_ok": reading.grid_ok,
+                "pv_energy_today_wh": reading.pv_energy_wh,
+                "grid_energy_today_wh": reading.grid_energy_wh,
+                "battery_charge_total_wh": reading.e_battery_charge_total_wh,
+                "battery_discharge_total_wh": reading.e_battery_discharge_total_wh,
+                "clock_offset_min": offset,
+            }
+        ev, co2, temp = self.shelly.ev_power, self.env.co2, self.env.temp
+        failing = THROTTLE.failing()
+        return {
+            "service": {
+                "version": PALM_VERSION,
+                "time": now.isoformat(timespec="seconds"),
+                "started": self._started_wall.isoformat(timespec="seconds"),
+                "uptime_s": round(time.monotonic() - self._started),
+                "cycle": self.loop_counter,
+            },
+            "system": system_stats(),
+            "inverter": inverter,
+            "ev": {"power_w": ev.get(STALE_AFTER_S), "age_s": round(ev.age()) if ev.value is not None else None},
+            "environment": {
+                "co2_g_per_kwh": co2.value,
+                "co2_age_s": round(co2.age()) if co2.value is not None else None,
+                "temp_c": temp.value,
+                "temp_age_s": round(temp.age()) if temp.value is not None else None,
+                "weather_symbol": self.env.weather_symbol,
+            },
+            "control": self.manager.status(now),
+            "pvoutput": self.uploader.status(),
+            "health": {"ok": not failing, "failing": failing},
+        }
+
+    def history_columns(self) -> dict[str, Any]:
+        """The chart history (empty when the history is switched off)."""
+        return (self.history or History(1)).columns()
+
+    async def _start_web(self) -> None:
+        """Start the status server if enabled. A failure to bind is logged and never stops the control loop."""
+        cfg = web_settings()
+        if not cfg["enable"]:
+            return
+        self.history = History(cfg["history_hours"] * 60) if cfg["history_hours"] > 0 else None
+        server = StatusServer(self.snapshot, self.history_columns, cfg["host"], cfg["port"], cfg["token"],
+                              cfg["allowed_hosts"])
+        try:
+            await server.start()
+        except (OSError, ValueError) as exc:
+            logger.error("Status server could not start on %s:%s: %s", cfg["host"], cfg["port"], exc)
+            self.history = None
+            return
+        self.web = server
+        shown = "<this-host>" if cfg["host"] in ("0.0.0.0", "::") else cfg["host"]
+        logger.info("Status server listening on http://%s:%d/", shown, server.port)
+        if not cfg["token"] and not is_loopback(cfg["host"]):
+            logger.warning("Status server is reachable from your network without a token (set Web.token)")
 
     async def _sleep_until_next_cycle(self) -> None:
         if stgs.pg.test_mode:
@@ -1327,6 +1862,8 @@ class Service:
         elif self.service_mode:
             await self.manager.update()
 
+        if self.history is not None:
+            self.history.add(self.inverter.fresh(), self.shelly.ev_power.get(STALE_AFTER_S))
         self._check_clock(now)
         self._maybe_upload(now)
 
@@ -1346,6 +1883,7 @@ class Service:
         logger.info("PALM Service Started")
         sd_notify("READY=1")
         if self.service_mode:
+            await self._start_web()                 # before manager.start(), so the page works with the inverter down
             await self.manager.start()
 
         while not self.stop_event.is_set():
@@ -1365,6 +1903,8 @@ class Service:
             await self._sleep_until_next_cycle()
 
         sd_notify("STOPPING=1")
+        if self.web is not None:
+            await self.web.stop()
         if _background:
             await asyncio.wait(list(_background), timeout=10)
         if self.service_mode:

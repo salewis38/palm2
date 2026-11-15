@@ -8,6 +8,7 @@ PVOutput.org uploads. See the changelog in `palm.py`.
 | Path | Purpose |
 |---|---|
 | `palm.py` | The application |
+| `palm_gui.py` | The status page (one HTML/CSS/JavaScript string). Optional: sits next to `palm.py`; without it a minimal page is served |
 | `palm_settings.example.py` | Copy to `palm_settings.py` (git-ignored) and edit |
 | `tests/` | Unit tests (standard library `unittest`; no hardware or network needed) |
 | `.github/workflows/ci.yml` | GitHub Actions: Python 3.10-3.13 on Ubuntu 24.04 (blocking) plus an informational Ubuntu 26.04 job |
@@ -32,6 +33,56 @@ The tests never import your real `palm_settings.py` or the real Modbus library. 
 fake settings module and a stub `givenergy_modbus`, and drive PALM through fakes for the inverter
 client, Shelly and PVOutput HTTP calls. If your application file is not called `palm.py`, run
 the tests with `PALM_MODULE=your_module_name`.
+
+## Status web page
+
+PALM can serve everything it knows on a small read-only web server, built into `palm.py` (standard library only; no
+extra packages, nothing written to disk). The page itself lives in **`palm_gui.py`**, which sits next to `palm.py`;
+copy both files when you deploy. It is **off by default**. Enable it in `palm_settings.py`:
+
+```python
+class Web:
+    enable = True
+    host = "127.0.0.1"      # this machine only; "0.0.0.0" to reach it from your LAN
+    port = 8080
+    token = ""              # optional shared secret (strongly recommended once host is not 127.0.0.1)
+    history_hours = 24      # chart history, kept in RAM only (0 = none)
+```
+
+Restart PALM, then browse to `http://<pi-address>:8080/` (or `curl http://localhost:8080/status.json`).
+
+| URL | What it returns |
+|---|---|
+| `/` | A live page: battery, solar, load, grid, EV, carbon and temperature; control state; Pi uptime and load averages; health; 24 h of charts. Refreshes itself. |
+| `/status.json` | Everything as JSON: service, host system stats (`uptime_s`, `load1`/`load5`/`load15`, `cpus`), inverter, EV, environment, control state, PVOutput queue, failing conditions. |
+| `/history.json` | The rolling history as parallel lists (`t`, `pv`, `load`, `grid`, `battery`, `soc`, `ev`), one sample a minute. |
+| `/metrics` | Prometheus text format, for Grafana or similar. |
+| `/healthz` | `ok`, always without a token, for uptime checks. It carries no information. |
+
+* **`palm_gui.py` is optional.** `palm.py` loads it only when the server starts. If it is missing, a minimal page that
+  points at the JSON and metrics is served instead (with a warning in the log); the controller, `/status.json` and
+  `/metrics` are unaffected. It contains data only (one string), so there is nothing in it to run or review for behaviour.
+* **System stats** are the host's uptime and 1/5/15-minute load averages (with the core count; the page marks a load
+  above the number of cores as high). They come from `/proc/uptime` and `os.getloadavg()`: reads from the kernel, no disk
+  access. `/metrics` has `palm_system_uptime_seconds`, `palm_system_load1/5/15` and `palm_system_cpus`.
+* **Data comes from memory.** Handlers only read snapshots PALM already holds, so a page load can never slow the control
+  loop, and a failure to bind the port is logged and ignored: control carries on. History (about 0.5 MB for 24 h) is lost
+  on restart; PVOutput keeps the long-term record. Grid power is shown as PALM reads it (positive = import).
+* **Security.** Read-only (GET and HEAD only; there are no controls on it) and no credentials or addresses of other
+  devices ever appear in it. It listens on **loopback only** unless you set `host`. If you do:
+  * set `Web.token` (`Authorization: Bearer <token>` or `?token=<token>`; the page passes it on to its own requests);
+  * restrict the port to your LAN, for example `sudo ufw allow from 192.168.1.0/24 to any port 8080 proto tcp`;
+  * the Host header must be an IP address, `localhost`, a single-label name (`raspberrypi`) or `*.local`/`*.lan`/
+    `*.home.arpa`, or listed in `Web.allowed_hosts`. This defeats DNS-rebinding attacks, in which a web site you visit
+    tries to read a service on your LAN through your browser;
+  * limits: 8 simultaneous connections, 5 s per request, small request and header sizes, one request per connection.
+  * It is plain HTTP: the token is visible to anyone who can watch your network traffic. For anything beyond a trusted
+    home LAN use a VPN (Tailscale, WireGuard) or a TLS reverse proxy (Caddy) in front of it, and **never port-forward it**.
+* **Prometheus:** `scrape_configs: [{job_name: palm, static_configs: [{targets: ["raspberrypi.local:8080"]}]}]`, plus
+  `authorization: {credentials: "<token>"}` if a token is set.
+* **Tests:** `tests/test_web.py` (protocol, limits, token, Host header, metrics, snapshot, integration) and
+  `tests/test_web_page.py`, which runs `palm_gui.py`'s JavaScript in Node against the real server output (skipped if Node
+  is not installed).
 
 ## Overnight register refresh
 
@@ -104,6 +155,7 @@ coverage.py (which CI also runs) because branch measurement is defined different
 * **PVOutput** - payload shape, secrets only in headers, spool and replay in order, rate-limit and
   auth handling, permanent-rejection handling, restart persistence.
 * **Shelly / weather / CO2** - parsing, malformed payloads, retries, staleness.
+* **Status web server** - requests, limits, token and Host-header checks, snapshot/metrics contents, the page's JavaScript.
 * **Service and CLI** - one-shot modes never command the inverter unexpectedly, crash and exit
   codes, instance lock, watchdog notifications, settings validation.
 
